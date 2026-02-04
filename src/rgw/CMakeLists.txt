@@ -316,12 +316,19 @@ if(WITH_RADOSGW_MOTR)
   target_link_libraries(rgw_common PRIVATE motr::motr)
 endif()
 
+# if(WITH_RADOSGW_DAOS)
+#   find_package(DAOS REQUIRED)
+#   set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -DDEBUG ")
+#   target_link_libraries(rgw_common PRIVATE daos dfs ds3 uuid duns)
+#   target_include_directories(rgw_common PRIVATE ${PC_DAOS_INCLUDEDIR} )
+#   link_directories( ${PC_DAOS_LIBRARY_DIRS} )
+# endif()
+
 if(WITH_RADOSGW_DAOS)
   find_package(DAOS REQUIRED)
-  set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -DDEBUG ")
-  target_link_libraries(rgw_common PRIVATE daos dfs ds3 uuid duns)
-  target_include_directories(rgw_common PRIVATE ${PC_DAOS_INCLUDEDIR} )
-  link_directories( ${PC_DAOS_LIBRARY_DIRS} )
+  # Use the variables defined at the end of your FindDAOS.cmake
+  target_include_directories(rgw_common PRIVATE ${DAOS_INCLUDE_DIRS})
+  target_link_libraries(rgw_common PRIVATE ${DAOS_LIBRARIES} uuid)
 endif()
 
 set(rgw_a_srcs

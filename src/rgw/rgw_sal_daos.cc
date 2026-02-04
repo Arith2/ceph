@@ -833,6 +833,33 @@ void DaosZoneGroup::get_placement_target_names(
   }
 }
 
+int DaosZoneGroup::get_zone_by_id(const std::string& id,
+                                  std::unique_ptr<Zone>* zone) {
+  if (group.zones.find(id) == group.zones.end()) {
+    return -ENOENT;
+  }
+  zone->reset(new DaosZone(store, *this));
+  return 0;
+}
+
+int DaosZoneGroup::get_zone_by_name(const std::string& name,
+                                    std::unique_ptr<Zone>* zone) {
+  for (const auto& [id, zinfo] : group.zones) {
+    if (zinfo.name == name) {
+      zone->reset(new DaosZone(store, *this));
+      return 0;
+    }
+  }
+  return -ENOENT;
+}
+
+int DaosZoneGroup::list_zones(std::list<std::string>& zone_ids) {
+  for (const auto& [id, _] : group.zones) {
+    zone_ids.push_back(id);
+  }
+  return 0;
+}
+
 int DaosZoneGroup::get_placement_tier(const rgw_placement_rule& rule,
                                       std::unique_ptr<PlacementTier>* tier) {
   std::map<std::string, RGWZoneGroupPlacementTarget>::const_iterator titer;
@@ -859,17 +886,7 @@ int DaosZoneGroup::get_placement_tier(const rgw_placement_rule& rule,
 
 ZoneGroup& DaosZone::get_zonegroup() { return zonegroup; }
 
-int DaosZone::get_zonegroup(const std::string& id,
-                            std::unique_ptr<ZoneGroup>* group) {
-  /* XXX: for now only one zonegroup supported */
-  ZoneGroup* zg;
-  zg = new DaosZoneGroup(store, zonegroup.get_group());
-
-  group->reset(zg);
-  return 0;
-}
-
-const rgw_zone_id& DaosZone::get_id() { return cur_zone_id; }
+const std::string& DaosZone::get_id() { return cur_zone_id; }
 
 const std::string& DaosZone::get_name() const {
   return zone_params->get_name();
@@ -883,6 +900,20 @@ bool DaosZone::has_zonegroup_api(const std::string& api) const { return false; }
 
 const std::string& DaosZone::get_current_period_id() {
   return current_period->get_id();
+}
+
+int DaosStore::get_zonegroup(const std::string& id,
+                             std::unique_ptr<ZoneGroup>* zg) {
+  // only a single zonegroup is currently backed
+  auto& zg_ref = static_cast<DaosZoneGroup&>(zone.get_zonegroup());
+  zg->reset(new DaosZoneGroup(this, zg_ref.get_group()));
+  return 0;
+}
+
+int DaosStore::list_all_zones(const DoutPrefixProvider* dpp,
+                              std::list<std::string>& zone_ids) {
+  zone_ids.push_back(zone.get_id());
+  return 0;
 }
 
 std::unique_ptr<LuaManager> DaosStore::get_lua_manager() {

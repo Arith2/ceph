@@ -25,6 +25,7 @@
 #include <set>
 #include <string>
 #include <vector>
+#include <list>
 
 #include "rgw_multi.h"
 #include "rgw_notify.h"
@@ -416,6 +417,11 @@ class DaosZoneGroup : public StoreZoneGroup {
   };
   virtual void get_placement_target_names(
       std::set<std::string>& names) const override;
+  virtual int get_zone_by_id(const std::string& id,
+                             std::unique_ptr<Zone>* zone) override;
+  virtual int get_zone_by_name(const std::string& name,
+                               std::unique_ptr<Zone>* zone) override;
+  virtual int list_zones(std::list<std::string>& zone_ids) override;
   virtual const std::string& get_default_placement_name() const override {
     return group.default_placement.name;
   };
@@ -450,7 +456,7 @@ class DaosZone : public StoreZone {
   RGWZoneParams* zone_params{
       nullptr}; /* internal zone params, e.g., rados pools */
   RGWPeriod* current_period{nullptr};
-  rgw_zone_id cur_zone_id;
+  std::string cur_zone_id;
 
  public:
   DaosZone(DaosStore* _store) : store(_store), zonegroup(_store) {
@@ -458,7 +464,7 @@ class DaosZone : public StoreZone {
     zone_public_config = new RGWZone();
     zone_params = new RGWZoneParams();
     current_period = new RGWPeriod();
-    cur_zone_id = rgw_zone_id(zone_params->get_id());
+    cur_zone_id = zone_params->get_id();
 
     // XXX: only default and STANDARD supported for now
     RGWZonePlacementInfo info;
@@ -473,7 +479,7 @@ class DaosZone : public StoreZone {
     zone_public_config = new RGWZone();
     zone_params = new RGWZoneParams();
     current_period = new RGWPeriod();
-    cur_zone_id = rgw_zone_id(zone_params->get_id());
+    cur_zone_id = zone_params->get_id();
 
     // XXX: only default and STANDARD supported for now
     RGWZonePlacementInfo info;
@@ -488,9 +494,7 @@ class DaosZone : public StoreZone {
     return std::make_unique<DaosZone>(store);
   }
   virtual ZoneGroup& get_zonegroup() override;
-  virtual int get_zonegroup(const std::string& id,
-                            std::unique_ptr<ZoneGroup>* zonegroup) override;
-  virtual const rgw_zone_id& get_id() override;
+  virtual const std::string& get_id() override;
   virtual const std::string& get_name() const override;
   virtual bool is_writeable() override;
   virtual bool get_redirect_endpoint(std::string* endpoint) override;
@@ -502,6 +506,9 @@ class DaosZone : public StoreZone {
   virtual const std::string& get_realm_name() { return realm->get_name(); }
   virtual const std::string& get_realm_id() { return realm->get_id(); }
   virtual const std::string_view get_tier_type() { return "rgw"; }
+  virtual RGWBucketSyncPolicyHandlerRef get_sync_policy_handler() override {
+    return nullptr;
+  }
 
   friend class DaosStore;
 };
@@ -923,6 +930,10 @@ class DaosStore : public StoreDriver {
                          const std::string& tenant, const std::string& name,
                          std::unique_ptr<Bucket>* bucket,
                          optional_yield y) override;
+  virtual int get_zonegroup(const std::string& id,
+                            std::unique_ptr<ZoneGroup>* zonegroup) override;
+  virtual int list_all_zones(const DoutPrefixProvider* dpp,
+                             std::list<std::string>& zone_ids) override;
   virtual bool is_meta_master() override;
   virtual int forward_request_to_master(const DoutPrefixProvider* dpp,
                                         User* user, obj_version* objv,
@@ -1049,6 +1060,8 @@ class DaosStore : public StoreDriver {
   virtual void finalize(void) override;
 
   virtual CephContext* ctx(void) override { return cctx; }
+
+  virtual void register_admin_apis(RGWRESTMgr* mgr) override {}
 
   virtual int initialize(CephContext* cct,
                          const DoutPrefixProvider* dpp) override;
