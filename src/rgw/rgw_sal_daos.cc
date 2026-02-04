@@ -2066,7 +2066,9 @@ std::unique_ptr<Writer> DaosMultipartUpload::get_writer(
     const rgw_placement_rule* ptail_placement_rule, uint64_t part_num,
     const std::string& part_num_str) {
   ldpp_dout(dpp, 20) << "DaosMultipartUpload::get_writer(): enter part="
-                     << part_num << " head_obj=" << (obj ? obj->get_name() : std::string(\"<null>\")) << dendl;
+                     << part_num << " head_obj="
+                     << (obj ? obj->get_name() : std::string("<null>"))
+                     << dendl;
   return std::make_unique<DaosMultipartWriter>(
       dpp, y, this, obj, store, owner, ptail_placement_rule,
       part_num, part_num_str);
