@@ -200,6 +200,14 @@ int DaosUser::trim_usage(const DoutPrefixProvider* dpp, uint64_t start_epoch,
   return DAOS_NOT_IMPLEMENTED_LOG(dpp);
 }
 
+int DaosUser::verify_mfa(const std::string& mfa_str, bool* verified,
+                         const DoutPrefixProvider* dpp, optional_yield y) {
+  if (verified) {
+    *verified = false;
+  }
+  return DAOS_NOT_IMPLEMENTED_LOG(dpp);
+}
+
 int DaosUser::load_user(const DoutPrefixProvider* dpp, optional_yield y) {
   const string name = info.user_id.to_str();
   ldpp_dout(dpp, 20) << "DEBUG: load_user, name=" << name << dendl;

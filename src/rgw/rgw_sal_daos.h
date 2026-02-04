@@ -197,6 +197,8 @@ class DaosUser : public StoreUser {
       std::map<rgw_user_bucket, rgw_usage_log_entry>& usage) override;
   virtual int trim_usage(const DoutPrefixProvider* dpp, uint64_t start_epoch,
                          uint64_t end_epoch) override;
+  virtual int verify_mfa(const std::string& mfa_str, bool* verified,
+                         const DoutPrefixProvider* dpp, optional_yield y) override;
 
   virtual int load_user(const DoutPrefixProvider* dpp,
                         optional_yield y) override;
@@ -564,7 +566,7 @@ class DaosObject : public StoreObject {
   RGWAccessControlPolicy acls;
 
  public:
-  struct DaosReadOp : public StoreReadOp {
+  struct DaosReadOp : public ReadOp {
    private:
     DaosObject* source;
 
@@ -588,7 +590,7 @@ class DaosObject : public StoreObject {
                          bufferlist& dest, optional_yield y) override;
   };
 
-  struct DaosDeleteOp : public StoreDeleteOp {
+  struct DaosDeleteOp : public DeleteOp {
    private:
     DaosObject* source;
 
