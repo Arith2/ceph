@@ -1672,20 +1672,20 @@ do_rgw_create_users()
         --display-name tenanteduser \
         --email tenanteduser@example.com -c $conf_fn > /dev/null
 
-    # Create Swift user
-    debug echo "setting up user tester"
-    $CEPH_BIN/radosgw-admin user create -c $conf_fn --subuser=test:tester --display-name=Tester-Subuser --key-type=swift --secret=testing --access=full > /dev/null
+    # # Create Swift user
+    # debug echo "setting up user tester"
+    # $CEPH_BIN/radosgw-admin user create -c $conf_fn --subuser=test:tester --display-name=Tester-Subuser --key-type=swift --secret=testing --access=full > /dev/null
 
     echo ""
     echo "S3 User Info:"
     echo "  access key:  $s3_akey"
     echo "  secret key:  $s3_skey"
     echo ""
-    echo "Swift User Info:"
-    echo "  account   : test"
-    echo "  user      : tester"
-    echo "  password  : testing"
-    echo ""
+    # echo "Swift User Info:"
+    # echo "  account   : test"
+    # echo "  user      : tester"
+    # echo "  password  : testing"
+    # echo ""
 }
 
 do_rgw()
