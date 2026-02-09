@@ -176,8 +176,7 @@ class DaosUser : public StoreUser {
   virtual int read_usage(
       const DoutPrefixProvider* dpp, uint64_t start_epoch, uint64_t end_epoch,
       uint32_t max_entries, bool* is_truncated, RGWUsageIter& usage_iter,
-      std::map<rgw_user_bucket, rgw_usage_log_entry>& usage,
-      optional_yield y) override;
+      std::map<rgw_user_bucket, rgw_usage_log_entry>& usage) override;
   virtual int trim_usage(const DoutPrefixProvider* dpp, uint64_t start_epoch,
                          uint64_t end_epoch, optional_yield y) override;
   virtual int verify_mfa(const std::string& mfa_str, bool* verified,
@@ -185,6 +184,21 @@ class DaosUser : public StoreUser {
   virtual int list_groups(const DoutPrefixProvider* dpp, optional_yield y,
                           std::string_view marker, uint32_t max_items,
                           GroupList& listing) override {
+    return DAOS_NOT_IMPLEMENTED_LOG(dpp);
+  }
+  virtual int count_account_groups(const DoutPrefixProvider* dpp,
+                                   optional_yield y,
+                                   std::string_view account_id,
+                                   uint32_t& count) override {
+    return DAOS_NOT_IMPLEMENTED_LOG(dpp);
+  }
+  virtual int list_account_groups(const DoutPrefixProvider* dpp,
+                                  optional_yield y,
+                                  std::string_view account_id,
+                                  std::string_view path_prefix,
+                                  std::string_view marker,
+                                  uint32_t max_items,
+                                  GroupList& listing) override {
     return DAOS_NOT_IMPLEMENTED_LOG(dpp);
   }
 
@@ -297,7 +311,6 @@ class DaosBucket : public StoreBucket {
                     optional_yield y) override;
   virtual int put_info(const DoutPrefixProvider* dpp, bool exclusive,
                        ceph::real_time mtime, optional_yield y) override;
-  virtual bool is_owner(User* user) override;
   virtual int check_empty(const DoutPrefixProvider* dpp,
                           optional_yield y) override;
   virtual int check_quota(const DoutPrefixProvider* dpp, RGWQuota& quota,
@@ -541,7 +554,7 @@ class DaosObject : public StoreObject {
   RGWAccessControlPolicy acls;
 
  public:
-  struct DaosReadOp : public StoreReadOp {
+  struct DaosReadOp : public ReadOp {
    private:
     DaosObject* source;
 
@@ -565,7 +578,7 @@ class DaosObject : public StoreObject {
                          bufferlist& dest, optional_yield y) override;
   };
 
-  struct DaosDeleteOp : public StoreDeleteOp {
+  struct DaosDeleteOp : public DeleteOp {
    private:
     DaosObject* source;
 
@@ -625,6 +638,9 @@ class DaosObject : public StoreObject {
   virtual int delete_obj_attrs(const DoutPrefixProvider* dpp,
                                const char* attr_name,
                                optional_yield y) override;
+  virtual bool is_sync_completed(const DoutPrefixProvider* dpp,
+                                 optional_yield y,
+                                 const ceph::real_time& timestamp) override;
   virtual bool is_expired() override;
   virtual void gen_rand_obj_instance_name() override;
   virtual std::unique_ptr<Object> clone() override {
@@ -632,6 +648,10 @@ class DaosObject : public StoreObject {
   }
   virtual std::unique_ptr<MPSerializer> get_serializer(
       const DoutPrefixProvider* dpp, const std::string& lock_name) override;
+  virtual int list_parts(const DoutPrefixProvider* dpp, CephContext* cct,
+                         int num_parts, int marker, int* next_marker,
+                         bool* truncated, list_parts_each_t cb,
+                         optional_yield y) override;
   virtual int transition(Bucket* bucket,
                          const rgw_placement_rule& placement_rule,
                          const real_time& mtime, uint64_t olh_epoch,
@@ -647,12 +667,12 @@ class DaosObject : public StoreObject {
   virtual int restore_obj_from_cloud(Bucket* bucket,
 			   rgw::sal::PlacementTier* tier,
 			   CephContext* cct,
-			   RGWObjTier& tier_config,
-			   uint64_t olh_epoch,
 			   std::optional<uint64_t> days,
 		           bool& in_progress,
 			   const DoutPrefixProvider* dpp,
-			   optional_yield y) override;
+			   optional_yield y) override {
+    return DAOS_NOT_IMPLEMENTED_LOG(dpp);
+  }
   virtual bool placement_rules_match(rgw_placement_rule& r1,
                                      rgw_placement_rule& r2) override;
   virtual int dump_obj_layout(const DoutPrefixProvider* dpp, optional_yield y,
@@ -798,7 +818,7 @@ class DaosMultipartWriter : public StoreWriter {
                        ceph::real_time delete_at, const char* if_match,
                        const char* if_nomatch, const std::string* user_data,
                        rgw_zone_set* zones_trace, bool* canceled,
-                       optional_yield y,
+                       const req_context& rctx,
                        uint32_t flags) override;
 
   const std::string& get_bucket_name();
@@ -857,7 +877,7 @@ class DaosMultipartUpload : public StoreMultipartUpload {
                    rgw::sal::Attrs& attrs) override;
   virtual int list_parts(const DoutPrefixProvider* dpp, CephContext* cct,
                          int num_parts, int marker, int* next_marker,
-                         bool* truncated,
+                         bool* truncated, optional_yield y = {},
                          bool assume_unsorted = false) override;
   virtual int abort(const DoutPrefixProvider* dpp, CephContext* cct, optional_yield y) override;
   virtual int complete(const DoutPrefixProvider* dpp, optional_yield y,
@@ -912,10 +932,9 @@ class DaosStore : public StoreDriver {
                                 const std::string& user_str, optional_yield y,
                                 std::unique_ptr<User>* user) override;
   virtual std::unique_ptr<Object> get_object(const rgw_obj_key& k) override;
-  std::unique_ptr<Bucket> get_bucket(User* u, const RGWBucketInfo& i) override;
-  int load_bucket(const DoutPrefixProvider* dpp, User* u,
-                  const rgw_bucket& b, std::unique_ptr<Bucket>* bucket,
-                  optional_yield y) override;
+  virtual std::unique_ptr<Bucket> get_bucket(const RGWBucketInfo& i) override;
+  int load_bucket(const DoutPrefixProvider* dpp, const rgw_bucket& b,
+                  std::unique_ptr<Bucket>* bucket, optional_yield y) override;
   virtual int get_zonegroup(const std::string& id,
                             std::unique_ptr<ZoneGroup>* zonegroup) override;
   virtual int list_all_zones(const DoutPrefixProvider* dpp,
@@ -931,8 +950,7 @@ class DaosStore : public StoreDriver {
   virtual std::string zone_unique_trans_id(const uint64_t unique_num) override;
   virtual int cluster_stat(RGWClusterStat& stats) override;
   virtual std::unique_ptr<Lifecycle> get_lifecycle(void) override;
-  virtual std::unique_ptr<Restore> get_restore(const int n_objs,
-		 const std::vector<std::string_view>& obj_names) override;
+  virtual std::unique_ptr<Restore> get_restore(void) override;
   virtual bool process_expired_objects(const DoutPrefixProvider *dpp, optional_yield y) override;
   virtual std::unique_ptr<Notification> get_notification(
       rgw::sal::Object* obj, rgw::sal::Object* src_obj, struct req_state* s,
@@ -949,14 +967,15 @@ class DaosStore : public StoreDriver {
       std::string& _req_id,
       optional_yield y) override;
   virtual RGWLC* get_rgwlc(void) override { return NULL; }
-  virtual RGWRestore* get_rgwrestore(void) override { return NULL; }
+  virtual Restore* get_rgwrestore(void) override { return NULL; }
   virtual RGWCoroutinesManagerRegistry* get_cr_registry() override {
     return NULL;
   }
 
   virtual int log_usage(
       const DoutPrefixProvider* dpp,
-      std::map<rgw_user_bucket, RGWUsageBatch>& usage_info) override;
+      std::map<rgw_user_bucket, RGWUsageBatch>& usage_info,
+      optional_yield y) override;
   virtual int log_op(const DoutPrefixProvider* dpp, std::string& oid,
                      bufferlist& bl) override;
   virtual int register_to_service_map(
@@ -968,7 +987,7 @@ class DaosStore : public StoreDriver {
                              RGWRateLimitInfo& anon_ratelimit) override;
   virtual int set_buckets_enabled(const DoutPrefixProvider* dpp,
                                   std::vector<rgw_bucket>& buckets,
-                                  bool enabled) override;
+                                  bool enabled, optional_yield y) override;
   virtual uint64_t get_new_req_id() override {
     return DAOS_NOT_IMPLEMENTED_LOG(nullptr);
   }
@@ -989,15 +1008,18 @@ class DaosStore : public StoreDriver {
       override {
     return;
   }
-  virtual int clear_usage(const DoutPrefixProvider* dpp) override {
+  virtual int clear_usage(const DoutPrefixProvider* dpp,
+                          optional_yield y) override {
     return DAOS_NOT_IMPLEMENTED_LOG(dpp);
   }
   virtual int read_all_usage(
       const DoutPrefixProvider* dpp, uint64_t start_epoch, uint64_t end_epoch,
       uint32_t max_entries, bool* is_truncated, RGWUsageIter& usage_iter,
-      std::map<rgw_user_bucket, rgw_usage_log_entry>& usage) override;
+      std::map<rgw_user_bucket, rgw_usage_log_entry>& usage,
+      optional_yield y) override;
   virtual int trim_all_usage(const DoutPrefixProvider* dpp,
-                             uint64_t start_epoch, uint64_t end_epoch) override;
+                             uint64_t start_epoch, uint64_t end_epoch,
+                             optional_yield y) override;
   virtual int get_config_key_val(std::string name, bufferlist* bl) override;
   virtual int meta_list_keys_init(const DoutPrefixProvider* dpp,
                                   const std::string& section,
@@ -1016,7 +1038,7 @@ class DaosStore : public StoreDriver {
   }
   virtual std::string get_host_id() { return ""; }
 
-  std::unique_ptr<LuaManager> get_lua_manager(const DoutPrefixProvider *dpp = nullptr, const std::string& luarocks_path = "") override;
+  std::unique_ptr<LuaManager> get_lua_manager(const std::string& luarocks_path = "") override;
   virtual void register_admin_apis(RGWRESTMgr* mgr) override {}
   virtual std::unique_ptr<RGWRole> get_role(
       std::string name, std::string tenant, rgw_account_id account_id, std::string path = "",

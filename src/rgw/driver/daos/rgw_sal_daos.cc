@@ -444,11 +444,6 @@ int DaosBucket::chown(const DoutPrefixProvider* dpp, const rgw_owner& new_user,
   return DAOS_NOT_IMPLEMENTED_LOG(dpp);
 }
 
-/* Make sure to call load_bucket() if you need it first */
-bool DaosBucket::is_owner(User* user) {
-  return (info.owner.compare(user->get_id()) == 0);
-}
-
 int DaosBucket::check_empty(const DoutPrefixProvider* dpp, optional_yield y) {
   /* XXX: Check if bucket contains any objects */
   return DAOS_NOT_IMPLEMENTED_LOG(dpp);
@@ -812,7 +807,7 @@ const std::string& DaosZone::get_current_period_id() {
   return current_period->get_id();
 }
 
-std::unique_ptr<LuaManager> DaosStore::get_lua_manager(const DoutPrefixProvider *dpp, const std::string& luarocks_path) {
+std::unique_ptr<LuaManager> DaosStore::get_lua_manager(const std::string& luarocks_path) {
   // DAOS Lua manager is not implemented; return basic instance to satisfy interface
   return std::make_unique<DaosLuaManager>(this);
 }
@@ -984,14 +979,25 @@ int DaosObject::transition_to_cloud(
 int DaosObject::restore_obj_from_cloud(Bucket* bucket,
           rgw::sal::PlacementTier* tier,
 	  CephContext* cct,
-          RGWObjTier& tier_config,
-          uint64_t olh_epoch,
           std::optional<uint64_t> days,
 	  bool& in_progress,
           const DoutPrefixProvider* dpp, 
           optional_yield y)
 {
   return DAOS_NOT_IMPLEMENTED_LOG(dpp);
+}
+
+int DaosObject::list_parts(const DoutPrefixProvider* dpp, CephContext* cct,
+                           int num_parts, int marker, int* next_marker,
+                           bool* truncated, list_parts_each_t cb,
+                           optional_yield y) {
+  return DAOS_NOT_IMPLEMENTED_LOG(dpp);
+}
+
+bool DaosObject::is_sync_completed(const DoutPrefixProvider* dpp,
+                                   optional_yield y,
+                                   const ceph::real_time& timestamp) {
+  return false;
 }
 
 bool DaosObject::placement_rules_match(rgw_placement_rule& r1,
@@ -1594,7 +1600,7 @@ int DaosMultipartUpload::init(const DoutPrefixProvider* dpp, optional_yield y,
 int DaosMultipartUpload::list_parts(const DoutPrefixProvider* dpp,
                                     CephContext* cct, int num_parts, int marker,
                                     int* next_marker, bool* truncated,
-                                    bool assume_unsorted) {
+                                    optional_yield y, bool assume_unsorted) {
   ldpp_dout(dpp, 20) << "DEBUG: list_parts" << dendl;
   // Init needed structures
   vector<struct ds3_multipart_part_info> multipart_part_infos(num_parts);
@@ -1669,7 +1675,7 @@ int DaosMultipartUpload::complete(
   do {
     ldpp_dout(dpp, 20) << "DaosMultipartUpload::complete(): list_parts()"
                        << dendl;
-    ret = list_parts(dpp, cct, max_parts, marker, &marker, &truncated);
+    ret = list_parts(dpp, cct, max_parts, marker, &marker, &truncated, y);
     if (ret == -ENOENT) {
       ret = -ERR_NO_SUCH_UPLOAD;
     }
@@ -2016,6 +2022,7 @@ int DaosMultipartWriter::process(bufferlist&& data, uint64_t offset) {
 int DaosMultipartWriter::complete(
     size_t accounted_size, const std::string& etag, ceph::real_time* mtime,
     ceph::real_time set_mtime, std::map<std::string, bufferlist>& attrs,
+    const std::optional<rgw::cksum::Cksum>& cksum,
     ceph::real_time delete_at, const char* if_match, const char* if_nomatch,
     const std::string* user_data, rgw_zone_set* zones_trace, bool* canceled,
     const req_context& rctx, uint32_t flags) {
@@ -2245,17 +2252,16 @@ inline std::ostream& operator<<(std::ostream& out, const rgw_user* u) {
   return out << s;
 }
 
-std::unique_ptr<Bucket> DaosStore::get_bucket(User* u, const RGWBucketInfo& i) {
+std::unique_ptr<Bucket> DaosStore::get_bucket(const RGWBucketInfo& i) {
   /* Don't need to fetch the bucket info, use the provided one */
-  return std::make_unique<DaosBucket>(this, i, u);
+  return std::make_unique<DaosBucket>(this, i);
 }
 
-int DaosStore::load_bucket(const DoutPrefixProvider* dpp, User* u,
+int DaosStore::load_bucket(const DoutPrefixProvider* dpp,
                            const rgw_bucket& b, std::unique_ptr<Bucket>* bucket,
                            optional_yield y) {
-  ldpp_dout(dpp, 20) << "DEBUG: get_bucket1: User: " << u << dendl;
-
-  *bucket = std::make_unique<DaosBucket>(this, b, u);
+  ldpp_dout(dpp, 20) << "DEBUG: load_bucket: " << b << dendl;
+  *bucket = std::make_unique<DaosBucket>(this, b);
   return (*bucket)->load_bucket(dpp, y);
 }
 
@@ -2276,10 +2282,9 @@ std::unique_ptr<Lifecycle> DaosStore::get_lifecycle(void) {
   return 0;
 }
 
-std::unique_ptr<Restore> DaosStore::get_restore(const int n_objs,
-				const std::vector<std::string_view>& obj_names) {
+std::unique_ptr<Restore> DaosStore::get_restore(void) {
   DAOS_NOT_IMPLEMENTED_LOG(nullptr);
-  return 0;
+  return nullptr;
 }
 
 bool DaosStore::process_expired_objects(const DoutPrefixProvider *dpp,
@@ -2311,7 +2316,8 @@ std::unique_ptr<Notification> DaosStore::get_notification(
 }
 
 int DaosStore::log_usage(const DoutPrefixProvider* dpp,
-                         map<rgw_user_bucket, RGWUsageBatch>& usage_info) {
+                         map<rgw_user_bucket, RGWUsageBatch>& usage_info,
+                         optional_yield y) {
   DAOS_NOT_IMPLEMENTED_LOG(dpp);
   return 0;
 }
@@ -2340,7 +2346,7 @@ void DaosStore::get_ratelimit(RGWRateLimitInfo& bucket_ratelimit,
 
 int DaosStore::set_buckets_enabled(const DoutPrefixProvider* dpp,
                                    std::vector<rgw_bucket>& buckets,
-                                   bool enabled) {
+                                   bool enabled, optional_yield y) {
   return DAOS_NOT_IMPLEMENTED_LOG(dpp);
 }
 
@@ -2361,12 +2367,14 @@ RGWDataSyncStatusManager* DaosStore::get_data_sync_manager(
 int DaosStore::read_all_usage(
     const DoutPrefixProvider* dpp, uint64_t start_epoch, uint64_t end_epoch,
     uint32_t max_entries, bool* is_truncated, RGWUsageIter& usage_iter,
-    map<rgw_user_bucket, rgw_usage_log_entry>& usage) {
+    map<rgw_user_bucket, rgw_usage_log_entry>& usage,
+    optional_yield y) {
   return DAOS_NOT_IMPLEMENTED_LOG(dpp);
 }
 
 int DaosStore::trim_all_usage(const DoutPrefixProvider* dpp,
-                              uint64_t start_epoch, uint64_t end_epoch) {
+                              uint64_t start_epoch, uint64_t end_epoch,
+                              optional_yield y) {
   return DAOS_NOT_IMPLEMENTED_LOG(dpp);
 }
 
