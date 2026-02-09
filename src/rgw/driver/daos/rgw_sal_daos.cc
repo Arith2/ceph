@@ -713,7 +713,13 @@ int DaosStore::initialize(CephContext* cct, const DoutPrefixProvider* dpp) {
 
   // DS3 init failed, allow the case where init is already done
   if (ret != 0 && ret != DER_ALREADY) {
-    ldout(cct, 0) << "ERROR: ds3_init() failed: " << ret << dendl;
+    /*
+     * radosgw-admin only prints "couldn't init storage provider" on init
+     * failures. Include the decoded errno/DER string here so callers have a
+     * useful hint (e.g. -EIO vs DER_*) when ds3_init() fails early.
+     */
+    ldout(cct, 0) << "ERROR: ds3_init() failed: " << ret
+                  << " (" << cpp_strerror(-ret) << ")" << dendl;
     return ret;
   }
 
@@ -725,7 +731,8 @@ int DaosStore::initialize(CephContext* cct, const DoutPrefixProvider* dpp) {
   ret = ds3_connect(daos_pool.c_str(), nullptr, &ds3, nullptr);
 
   if (ret != 0) {
-    ldout(cct, 0) << "ERROR: ds3_connect() failed: " << ret << dendl;
+    ldout(cct, 0) << "ERROR: ds3_connect() failed: " << ret
+                  << " (" << cpp_strerror(-ret) << ")" << dendl;
     ds3_fini();
   }
 
