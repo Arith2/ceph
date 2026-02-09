@@ -2367,8 +2367,7 @@ RGWDataSyncStatusManager* DaosStore::get_data_sync_manager(
 int DaosStore::read_all_usage(
     const DoutPrefixProvider* dpp, uint64_t start_epoch, uint64_t end_epoch,
     uint32_t max_entries, bool* is_truncated, RGWUsageIter& usage_iter,
-    map<rgw_user_bucket, rgw_usage_log_entry>& usage,
-    optional_yield y) {
+    map<rgw_user_bucket, rgw_usage_log_entry>& usage) {
   return DAOS_NOT_IMPLEMENTED_LOG(dpp);
 }
 

@@ -186,21 +186,7 @@ class DaosUser : public StoreUser {
                           GroupList& listing) override {
     return DAOS_NOT_IMPLEMENTED_LOG(dpp);
   }
-  virtual int count_account_groups(const DoutPrefixProvider* dpp,
-                                   optional_yield y,
-                                   std::string_view account_id,
-                                   uint32_t& count) override {
-    return DAOS_NOT_IMPLEMENTED_LOG(dpp);
-  }
-  virtual int list_account_groups(const DoutPrefixProvider* dpp,
-                                  optional_yield y,
-                                  std::string_view account_id,
-                                  std::string_view path_prefix,
-                                  std::string_view marker,
-                                  uint32_t max_items,
-                                  GroupList& listing) override {
-    return DAOS_NOT_IMPLEMENTED_LOG(dpp);
-  }
+  // Account group APIs are not supported yet.
 
   virtual int load_user(const DoutPrefixProvider* dpp,
                         optional_yield y) override;
@@ -280,6 +266,11 @@ class DaosBucket : public StoreBucket {
   virtual std::unique_ptr<Object> get_object(const rgw_obj_key& k) override;
   virtual int list(const DoutPrefixProvider* dpp, ListParams&, int,
                    ListResults&, optional_yield y) override;
+  virtual int create(const DoutPrefixProvider* dpp,
+                     const CreateParams& params,
+                     optional_yield y) override {
+    return DAOS_NOT_IMPLEMENTED_LOG(dpp);
+  }
   virtual int remove(const DoutPrefixProvider* dpp, bool delete_children,
                      optional_yield y) override;
   virtual int remove_bypass_gc(int concurrent_max,
@@ -877,7 +868,7 @@ class DaosMultipartUpload : public StoreMultipartUpload {
                    rgw::sal::Attrs& attrs) override;
   virtual int list_parts(const DoutPrefixProvider* dpp, CephContext* cct,
                          int num_parts, int marker, int* next_marker,
-                         bool* truncated, optional_yield y = {},
+                         bool* truncated, optional_yield y,
                          bool assume_unsorted = false) override;
   virtual int abort(const DoutPrefixProvider* dpp, CephContext* cct, optional_yield y) override;
   virtual int complete(const DoutPrefixProvider* dpp, optional_yield y,
@@ -967,7 +958,7 @@ class DaosStore : public StoreDriver {
       std::string& _req_id,
       optional_yield y) override;
   virtual RGWLC* get_rgwlc(void) override { return NULL; }
-  virtual Restore* get_rgwrestore(void) override { return NULL; }
+  virtual rgw::restore::Restore* get_rgwrestore(void) override { return NULL; }
   virtual RGWCoroutinesManagerRegistry* get_cr_registry() override {
     return NULL;
   }
@@ -1015,8 +1006,7 @@ class DaosStore : public StoreDriver {
   virtual int read_all_usage(
       const DoutPrefixProvider* dpp, uint64_t start_epoch, uint64_t end_epoch,
       uint32_t max_entries, bool* is_truncated, RGWUsageIter& usage_iter,
-      std::map<rgw_user_bucket, rgw_usage_log_entry>& usage,
-      optional_yield y) override;
+      std::map<rgw_user_bucket, rgw_usage_log_entry>& usage) override;
   virtual int trim_all_usage(const DoutPrefixProvider* dpp,
                              uint64_t start_epoch, uint64_t end_epoch,
                              optional_yield y) override;
