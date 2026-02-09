@@ -168,35 +168,25 @@ class DaosUser : public StoreUser {
   virtual std::unique_ptr<User> clone() override {
     return std::make_unique<DaosUser>(*this);
   }
-  virtual int create_bucket(
-      const DoutPrefixProvider* dpp, const rgw_bucket& b,
-      const std::string& zonegroup_id, rgw_placement_rule& placement_rule,
-      std::string& swift_ver_location, const RGWQuotaInfo* pquota_info,
-      const RGWAccessControlPolicy& policy, Attrs& attrs, RGWBucketInfo& info,
-      obj_version& ep_objv, bool exclusive, bool obj_lock_enabled,
-      bool* existed, req_info& req_info, std::unique_ptr<Bucket>* bucket,
-      optional_yield y) override;
   virtual int read_attrs(const DoutPrefixProvider* dpp,
                          optional_yield y) override;
   virtual int merge_and_store_attrs(const DoutPrefixProvider* dpp,
                                     Attrs& new_attrs,
                                     optional_yield y) override;
-  virtual int read_stats(const DoutPrefixProvider* dpp, optional_yield y,
-                         RGWStorageStats* stats,
-                         ceph::real_time* last_stats_sync = nullptr,
-                         ceph::real_time* last_stats_update = nullptr) override;
-  virtual int read_stats_async(const DoutPrefixProvider* dpp,
-                               boost::intrusive_ptr<ReadStatsCB> cb) override;
-  virtual int complete_flush_stats(const DoutPrefixProvider* dpp,
-                                   optional_yield y) override;
   virtual int read_usage(
       const DoutPrefixProvider* dpp, uint64_t start_epoch, uint64_t end_epoch,
       uint32_t max_entries, bool* is_truncated, RGWUsageIter& usage_iter,
-      std::map<rgw_user_bucket, rgw_usage_log_entry>& usage) override;
+      std::map<rgw_user_bucket, rgw_usage_log_entry>& usage,
+      optional_yield y) override;
   virtual int trim_usage(const DoutPrefixProvider* dpp, uint64_t start_epoch,
-                         uint64_t end_epoch) override;
+                         uint64_t end_epoch, optional_yield y) override;
   virtual int verify_mfa(const std::string& mfa_str, bool* verified,
                          const DoutPrefixProvider* dpp, optional_yield y) override;
+  virtual int list_groups(const DoutPrefixProvider* dpp, optional_yield y,
+                          std::string_view marker, uint32_t max_items,
+                          GroupList& listing) override {
+    return DAOS_NOT_IMPLEMENTED_LOG(dpp);
+  }
 
   virtual int load_user(const DoutPrefixProvider* dpp,
                         optional_yield y) override;
@@ -265,25 +255,11 @@ class DaosBucket : public StoreBucket {
     // TODO: deep copy all objects
   }
 
-  DaosBucket(DaosStore* _st, User* _u) : StoreBucket(_u), store(_st), acls() {}
-
   DaosBucket(DaosStore* _st, const rgw_bucket& _b)
       : StoreBucket(_b), store(_st), acls() {}
 
-  DaosBucket(DaosStore* _st, const RGWBucketEnt& _e)
-      : StoreBucket(_e), store(_st), acls() {}
-
   DaosBucket(DaosStore* _st, const RGWBucketInfo& _i)
       : StoreBucket(_i), store(_st), acls() {}
-
-  DaosBucket(DaosStore* _st, const rgw_bucket& _b, User* _u)
-      : StoreBucket(_b, _u), store(_st), acls() {}
-
-  DaosBucket(DaosStore* _st, const RGWBucketEnt& _e, User* _u)
-      : StoreBucket(_e, _u), store(_st), acls() {}
-
-  DaosBucket(DaosStore* _st, const RGWBucketInfo& _i, User* _u)
-      : StoreBucket(_i, _u), store(_st), acls() {}
 
   ~DaosBucket();
 
@@ -300,7 +276,7 @@ class DaosBucket : public StoreBucket {
   virtual int set_acl(const DoutPrefixProvider* dpp,
                       RGWAccessControlPolicy& acl, optional_yield y) override;
   virtual int load_bucket(const DoutPrefixProvider* dpp, optional_yield y) override;
-  virtual int read_stats(const DoutPrefixProvider* dpp,
+  virtual int read_stats(const DoutPrefixProvider* dpp, optional_yield y,
                          const bucket_index_layout_generation& idx_layout,
                          int shard_id, std::string* bucket_ver,
                          std::string* master_ver,
@@ -312,12 +288,15 @@ class DaosBucket : public StoreBucket {
                                int shard_id,
                                boost::intrusive_ptr<ReadStatsCB> ctx) override;
   virtual int sync_owner_stats(const DoutPrefixProvider* dpp,
-                               optional_yield y) override;
-  virtual int check_bucket_shards(const DoutPrefixProvider* dpp) override;
+                               optional_yield y,
+                               RGWBucketEnt* optional_ent = nullptr) override;
+  virtual int check_bucket_shards(const DoutPrefixProvider* dpp,
+                                  uint64_t num_objs,
+                                  optional_yield y) override;
   virtual int chown(const DoutPrefixProvider* dpp, const rgw_owner& new_user,
                     optional_yield y) override;
   virtual int put_info(const DoutPrefixProvider* dpp, bool exclusive,
-                       ceph::real_time mtime) override;
+                       ceph::real_time mtime, optional_yield y) override;
   virtual bool is_owner(User* user) override;
   virtual int check_empty(const DoutPrefixProvider* dpp,
                           optional_yield y) override;
@@ -327,24 +306,28 @@ class DaosBucket : public StoreBucket {
   virtual int merge_and_store_attrs(const DoutPrefixProvider* dpp, Attrs& attrs,
                                     optional_yield y) override;
   virtual int try_refresh_info(const DoutPrefixProvider* dpp,
-                               ceph::real_time* pmtime) override;
+                               ceph::real_time* pmtime,
+                               optional_yield y) override;
   virtual int read_usage(
       const DoutPrefixProvider* dpp, uint64_t start_epoch, uint64_t end_epoch,
       uint32_t max_entries, bool* is_truncated, RGWUsageIter& usage_iter,
       std::map<rgw_user_bucket, rgw_usage_log_entry>& usage) override;
   virtual int trim_usage(const DoutPrefixProvider* dpp, uint64_t start_epoch,
-                         uint64_t end_epoch) override;
+                         uint64_t end_epoch, optional_yield y) override;
   virtual int remove_objs_from_index(
       const DoutPrefixProvider* dpp,
       std::list<rgw_obj_index_key>& objs_to_unlink) override;
   virtual int check_index(
-      const DoutPrefixProvider* dpp,
+      const DoutPrefixProvider* dpp, optional_yield y,
       std::map<RGWObjCategory, RGWStorageStats>& existing_stats,
       std::map<RGWObjCategory, RGWStorageStats>& calculated_stats) override;
-  virtual int rebuild_index(const DoutPrefixProvider* dpp) override;
+  virtual int rebuild_index(const DoutPrefixProvider* dpp,
+                            optional_yield y) override;
   virtual int set_tag_timeout(const DoutPrefixProvider* dpp,
+                              optional_yield y,
                               uint64_t timeout) override;
-  virtual int purge_instance(const DoutPrefixProvider* dpp) override;
+  virtual int purge_instance(const DoutPrefixProvider* dpp,
+                             optional_yield y) override;
   virtual std::unique_ptr<Bucket> clone() override {
     return std::make_unique<DaosBucket>(*this);
   }
@@ -357,9 +340,9 @@ class DaosBucket : public StoreBucket {
       std::string& marker, const std::string& delim, const int& max_uploads,
       std::vector<std::unique_ptr<MultipartUpload>>& uploads,
       std::map<std::string, bool>* common_prefixes,
-      bool* is_truncated) override;
+      bool* is_truncated, optional_yield y) override;
   virtual int abort_multiparts(const DoutPrefixProvider* dpp,
-                               CephContext* cct) override;
+                               CephContext* cct, optional_yield y) override;
 
   int open(const DoutPrefixProvider* dpp);
   int close(const DoutPrefixProvider* dpp);

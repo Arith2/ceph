@@ -106,102 +106,7 @@ int DaosStore::list_all_zones(const DoutPrefixProvider* dpp,
   return 0;
 }
 
-int DaosUser::create_bucket(
-    const DoutPrefixProvider* dpp, const rgw_bucket& b,
-    const std::string& zonegroup_id, rgw_placement_rule& placement_rule,
-    std::string& swift_ver_location, const RGWQuotaInfo* pquota_info,
-    const RGWAccessControlPolicy& policy, Attrs& attrs, RGWBucketInfo& info,
-    obj_version& ep_objv, bool exclusive, bool obj_lock_enabled, bool* existed,
-    req_info& req_info, std::unique_ptr<Bucket>* bucket_out, optional_yield y) {
-  ldpp_dout(dpp, 20) << "DEBUG: create_bucket:" << b.name << dendl;
-  int ret;
-  std::unique_ptr<Bucket> bucket;
-
-  // Look up the bucket. Create it if it doesn't exist.
-  ret = this->store->load_bucket(dpp, this, b, &bucket, y);
-  if (ret != 0 && ret != -ENOENT) {
-    return ret;
-  }
-
-  if (ret != -ENOENT) {
-    *existed = true;
-    if (swift_ver_location.empty()) {
-      swift_ver_location = bucket->get_info().swift_ver_location;
-    }
-    placement_rule.inherit_from(bucket->get_info().placement_rule);
-
-    // TODO: ACL policy
-    // // don't allow changes to the acl policy
-    // RGWAccessControlPolicy old_policy(ctx());
-    // int rc = rgw_op_get_bucket_policy_from_attr(
-    //           dpp, this, u, bucket->get_attrs(), &old_policy, y);
-    // if (rc >= 0 && old_policy != policy) {
-    //    bucket_out->swap(bucket);
-    //    return -EEXIST;
-    //}
-  } else {
-    placement_rule.name = "default";
-    placement_rule.storage_class = "STANDARD";
-    bucket = std::make_unique<DaosBucket>(store, b, this);
-    bucket->set_attrs(attrs);
-
-    *existed = false;
-  }
-
-  // TODO: how to handle zone and multi-site.
-
-  if (!*existed) {
-    info.placement_rule = placement_rule;
-    info.bucket = b;
-    info.owner = this->get_info().user_id;
-    info.zonegroup = zonegroup_id;
-    info.creation_time = ceph::real_clock::now();
-    if (obj_lock_enabled)
-      info.flags = BUCKET_VERSIONED | BUCKET_OBJ_LOCK_ENABLED;
-    bucket->set_version(ep_objv);
-    bucket->get_info() = info;
-
-    // Create a new bucket:
-    DaosBucket* daos_bucket = static_cast<DaosBucket*>(bucket.get());
-    bufferlist bl;
-    std::unique_ptr<struct ds3_bucket_info> bucket_info =
-        daos_bucket->get_encoded_info(bl, ceph::real_time());
-    ret = ds3_bucket_create(bucket->get_name().c_str(), bucket_info.get(),
-                            nullptr, store->ds3, nullptr);
-    if (ret != 0) {
-      ldpp_dout(dpp, 0) << "ERROR: ds3_bucket_create failed! ret=" << ret
-                        << dendl;
-      return ret;
-    }
-  } else {
-    bucket->set_version(ep_objv);
-    bucket->get_info() = info;
-  }
-
-  bucket_out->swap(bucket);
-
-  return ret;
-}
-
 int DaosUser::read_attrs(const DoutPrefixProvider* dpp, optional_yield y) {
-  return DAOS_NOT_IMPLEMENTED_LOG(dpp);
-}
-
-int DaosUser::read_stats(const DoutPrefixProvider* dpp, optional_yield y,
-                         RGWStorageStats* stats,
-                         ceph::real_time* last_stats_sync,
-                         ceph::real_time* last_stats_update) {
-  return DAOS_NOT_IMPLEMENTED_LOG(dpp);
-}
-
-/* stats - Not for first pass */
-int DaosUser::read_stats_async(const DoutPrefixProvider* dpp,
-                               boost::intrusive_ptr<ReadStatsCB> cb) {
-  return DAOS_NOT_IMPLEMENTED_LOG(dpp);
-}
-
-int DaosUser::complete_flush_stats(const DoutPrefixProvider* dpp,
-                                   optional_yield y) {
   return DAOS_NOT_IMPLEMENTED_LOG(dpp);
 }
 
@@ -213,7 +118,7 @@ int DaosUser::read_usage(const DoutPrefixProvider* dpp, uint64_t start_epoch,
 }
 
 int DaosUser::trim_usage(const DoutPrefixProvider* dpp, uint64_t start_epoch,
-                         uint64_t end_epoch) {
+                         uint64_t end_epoch, optional_yield y) {
   return DAOS_NOT_IMPLEMENTED_LOG(dpp);
 }
 
@@ -453,7 +358,7 @@ int DaosBucket::remove_bypass_gc(int concurrent_max,
 }
 
 int DaosBucket::put_info(const DoutPrefixProvider* dpp, bool exclusive,
-                         ceph::real_time _mtime) {
+                         ceph::real_time _mtime, optional_yield y) {
   ldpp_dout(dpp, 20) << "DEBUG: put_info(): bucket name=" << get_name()
                      << dendl;
 
@@ -508,7 +413,7 @@ int DaosBucket::load_bucket(const DoutPrefixProvider* dpp, optional_yield y) {
 }
 
 /* stats - Not for first pass */
-int DaosBucket::read_stats(const DoutPrefixProvider* dpp,
+int DaosBucket::read_stats(const DoutPrefixProvider* dpp, optional_yield y,
                            const bucket_index_layout_generation& idx_layout,
                            int shard_id, std::string* bucket_ver,
                            std::string* master_ver,
@@ -525,11 +430,12 @@ int DaosBucket::read_stats_async(
 }
 
 int DaosBucket::sync_owner_stats(const DoutPrefixProvider* dpp,
-                                 optional_yield y) {
+                                 optional_yield y, RGWBucketEnt* optional_ent) {
   return DAOS_NOT_IMPLEMENTED_LOG(dpp);
 }
 
-int DaosBucket::check_bucket_shards(const DoutPrefixProvider* dpp) {
+int DaosBucket::check_bucket_shards(const DoutPrefixProvider* dpp,
+                                    uint64_t num_objs, optional_yield y) {
   return DAOS_NOT_IMPLEMENTED_LOG(dpp);
 }
 
@@ -563,11 +469,11 @@ int DaosBucket::merge_and_store_attrs(const DoutPrefixProvider* dpp,
     attrs[it.first] = it.second;
   }
 
-  return put_info(dpp, y, ceph::real_time());
+  return put_info(dpp, false, ceph::real_time(), y);
 }
 
 int DaosBucket::try_refresh_info(const DoutPrefixProvider* dpp,
-                                 ceph::real_time* pmtime) {
+                                 ceph::real_time* pmtime, optional_yield y) {
   return DAOS_NOT_IMPLEMENTED_LOG(dpp);
 }
 
@@ -575,12 +481,13 @@ int DaosBucket::try_refresh_info(const DoutPrefixProvider* dpp,
 int DaosBucket::read_usage(const DoutPrefixProvider* dpp, uint64_t start_epoch,
                            uint64_t end_epoch, uint32_t max_entries,
                            bool* is_truncated, RGWUsageIter& usage_iter,
-                           map<rgw_user_bucket, rgw_usage_log_entry>& usage) {
+                           map<rgw_user_bucket, rgw_usage_log_entry>& usage,
+                           optional_yield y) {
   return DAOS_NOT_IMPLEMENTED_LOG(dpp);
 }
 
 int DaosBucket::trim_usage(const DoutPrefixProvider* dpp, uint64_t start_epoch,
-                           uint64_t end_epoch) {
+                           uint64_t end_epoch, optional_yield y) {
   return DAOS_NOT_IMPLEMENTED_LOG(dpp);
 }
 
@@ -595,25 +502,27 @@ int DaosBucket::remove_objs_from_index(
 }
 
 int DaosBucket::check_index(
-    const DoutPrefixProvider* dpp,
+    const DoutPrefixProvider* dpp, optional_yield y,
     std::map<RGWObjCategory, RGWStorageStats>& existing_stats,
     std::map<RGWObjCategory, RGWStorageStats>& calculated_stats) {
   /* XXX: stats not supported yet */
   return DAOS_NOT_IMPLEMENTED_LOG(dpp);
 }
 
-int DaosBucket::rebuild_index(const DoutPrefixProvider* dpp) {
+int DaosBucket::rebuild_index(const DoutPrefixProvider* dpp,
+                              optional_yield y) {
   /* there is no index table in DAOS. Not applicable */
   return DAOS_NOT_IMPLEMENTED_LOG(dpp);
 }
 
 int DaosBucket::set_tag_timeout(const DoutPrefixProvider* dpp,
-                                uint64_t timeout) {
+                                optional_yield y, uint64_t timeout) {
   /* XXX: CHECK: set tag timeout for all the bucket objects? */
   return DAOS_NOT_IMPLEMENTED_LOG(dpp);
 }
 
-int DaosBucket::purge_instance(const DoutPrefixProvider* dpp) {
+int DaosBucket::purge_instance(const DoutPrefixProvider* dpp,
+                               optional_yield y) {
   /* XXX: CHECK: for DAOS only single instance supported.
    * Remove all the objects for that instance? Anything extra needed?
    */
@@ -722,7 +631,7 @@ int DaosBucket::list_multiparts(
     const DoutPrefixProvider* dpp, const string& prefix, string& marker,
     const string& delim, const int& max_uploads,
     vector<std::unique_ptr<MultipartUpload>>& uploads,
-    map<string, bool>* common_prefixes, bool* is_truncated) {
+    map<string, bool>* common_prefixes, bool* is_truncated, optional_yield y) {
   ldpp_dout(dpp, 20) << "DEBUG: list_multiparts" << dendl;
   // End of uploading
   if (max_uploads == 0) {
@@ -780,7 +689,7 @@ int DaosBucket::list_multiparts(
 }
 
 int DaosBucket::abort_multiparts(const DoutPrefixProvider* dpp,
-                                 CephContext* cct) {
+                                 CephContext* cct, optional_yield y) {
   return DAOS_NOT_IMPLEMENTED_LOG(dpp);
 }
 
