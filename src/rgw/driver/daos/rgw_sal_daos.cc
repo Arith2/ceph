@@ -85,16 +85,11 @@ int DaosStore::list_buckets(const DoutPrefixProvider* dpp,
     dbinfo.decode(iter);
     RGWBucketEnt ent;
     ent.bucket = dbinfo.info.bucket;
-    ent.owner = dbinfo.info.owner;
     ent.creation_time = dbinfo.info.creation_time;
     buckets.buckets.push_back(ent);
   }
 
-  if (is_truncated && !bucket_infos.empty()) {
-    buckets.next_marker = bucket_infos.back().info.bucket.name;
-  } else {
-    buckets.next_marker.clear();
-  }
+  buckets.next_marker = is_truncated ? bucket_infos.back().name : std::string();
   return 0;
 }
 
@@ -1508,9 +1503,8 @@ int DaosAtomicWriter::complete(
   ent.meta.mtime =
       real_clock::is_zero(set_mtime) ? ceph::real_clock::now() : set_mtime;
   ent.meta.etag = etag;
-  ent.meta.owner = owner.to_str();
-  ent.meta.owner_display_name =
-      obj.get_bucket()->get_owner()->get_display_name();
+  ent.meta.owner = to_string(owner.id);
+  ent.meta.owner_display_name = owner.display_name;
   bool is_versioned = obj.get_bucket()->versioned();
   if (is_versioned)
     ent.flags =

@@ -1012,6 +1012,168 @@ class DaosStore : public StoreDriver {
       const DoutPrefixProvider* dpp, uint64_t start_epoch, uint64_t end_epoch,
       uint32_t max_entries, bool* is_truncated, RGWUsageIter& usage_iter,
       std::map<rgw_user_bucket, rgw_usage_log_entry>& usage) override;
+
+  // Account / group APIs not yet implemented
+  virtual int load_account_by_id(const DoutPrefixProvider* dpp,
+                                 optional_yield y, std::string_view id,
+                                 RGWAccountInfo& info, rgw::sal::Attrs& attrs,
+                                 RGWObjVersionTracker& objv) override {
+    return DAOS_NOT_IMPLEMENTED_LOG(dpp);
+  }
+  virtual int load_account_by_name(const DoutPrefixProvider* dpp,
+                                   optional_yield y, std::string_view name,
+                                   std::string_view tenant,
+                                   RGWAccountInfo& info, rgw::sal::Attrs& attrs,
+                                   RGWObjVersionTracker& objv) override {
+    return DAOS_NOT_IMPLEMENTED_LOG(dpp);
+  }
+  virtual int load_account_by_email(const DoutPrefixProvider* dpp,
+                                    optional_yield y, std::string_view email,
+                                    RGWAccountInfo& info, rgw::sal::Attrs& attrs,
+                                    RGWObjVersionTracker& objv) override {
+    return DAOS_NOT_IMPLEMENTED_LOG(dpp);
+  }
+  virtual int store_account(const DoutPrefixProvider* dpp, optional_yield y,
+                            bool exclusive, const RGWAccountInfo& info,
+                            const RGWAccountInfo* old_info,
+                            const rgw::sal::Attrs& attrs,
+                            RGWObjVersionTracker& objv) override {
+    return DAOS_NOT_IMPLEMENTED_LOG(dpp);
+  }
+  virtual int delete_account(const DoutPrefixProvider* dpp, optional_yield y,
+                             const RGWAccountInfo& info,
+                             RGWObjVersionTracker& objv) override {
+    return DAOS_NOT_IMPLEMENTED_LOG(dpp);
+  }
+  virtual int load_stats(const DoutPrefixProvider* dpp, optional_yield y,
+                         const rgw_owner& owner, RGWStorageStats& stats,
+                         ceph::real_time& last_stats_sync,
+                         ceph::real_time& last_stats_update) override {
+    return DAOS_NOT_IMPLEMENTED_LOG(dpp);
+  }
+  virtual int load_stats_async(const DoutPrefixProvider* dpp,
+                               const rgw_owner& owner,
+                               boost::intrusive_ptr<ReadStatsCB> cb) override {
+    return DAOS_NOT_IMPLEMENTED_LOG(dpp);
+  }
+  virtual int reset_stats(const DoutPrefixProvider* dpp, optional_yield y,
+                          const rgw_owner& owner) override {
+    return DAOS_NOT_IMPLEMENTED_LOG(dpp);
+  }
+  virtual int complete_flush_stats(const DoutPrefixProvider* dpp,
+                                   optional_yield y,
+                                   const rgw_owner& owner) override {
+    return DAOS_NOT_IMPLEMENTED_LOG(dpp);
+  }
+  virtual int load_owner_by_email(const DoutPrefixProvider* dpp,
+                                  optional_yield y, std::string_view email,
+                                  rgw_owner& owner) override {
+    return DAOS_NOT_IMPLEMENTED_LOG(dpp);
+  }
+  virtual int count_account_roles(const DoutPrefixProvider* dpp,
+                                  optional_yield y,
+                                  std::string_view account_id,
+                                  uint32_t& count) override {
+    return DAOS_NOT_IMPLEMENTED_LOG(dpp);
+  }
+  virtual int list_account_roles(const DoutPrefixProvider* dpp,
+                                 optional_yield y,
+                                 std::string_view account_id,
+                                 std::string_view path_prefix,
+                                 std::string_view marker, uint32_t max_items,
+                                 RoleList& listing) override {
+    return DAOS_NOT_IMPLEMENTED_LOG(dpp);
+  }
+  virtual int load_account_user_by_name(const DoutPrefixProvider* dpp,
+                                        optional_yield y,
+                                        std::string_view account_id,
+                                        std::string_view name,
+                                        std::string_view tenant,
+                                        std::unique_ptr<User>* user) override {
+    return DAOS_NOT_IMPLEMENTED_LOG(dpp);
+  }
+  virtual int count_account_users(const DoutPrefixProvider* dpp,
+                                  optional_yield y,
+                                  std::string_view account_id,
+                                  uint32_t& count) override {
+    return DAOS_NOT_IMPLEMENTED_LOG(dpp);
+  }
+  virtual int list_account_users(const DoutPrefixProvider* dpp,
+                                 optional_yield y,
+                                 std::string_view account_id,
+                                 std::string_view path_prefix,
+                                 std::string_view marker,
+                                 std::string_view tenant,
+                                 uint32_t max_items,
+                                 UserList& listing) override {
+    return DAOS_NOT_IMPLEMENTED_LOG(dpp);
+  }
+  virtual int load_group_by_id(const DoutPrefixProvider* dpp,
+                               optional_yield y, std::string_view id,
+                               RGWGroupInfo& info, rgw::sal::Attrs& attrs,
+                               RGWObjVersionTracker& objv) override {
+    return DAOS_NOT_IMPLEMENTED_LOG(dpp);
+  }
+  virtual int load_group_by_name(const DoutPrefixProvider* dpp,
+                                 optional_yield y,
+                                 std::string_view account_id,
+                                 std::string_view name,
+                                 RGWGroupInfo& info, rgw::sal::Attrs& attrs,
+                                 RGWObjVersionTracker& objv) override {
+    return DAOS_NOT_IMPLEMENTED_LOG(dpp);
+  }
+  virtual int store_group(const DoutPrefixProvider* dpp, optional_yield y,
+                          const RGWGroupInfo& info,
+                          const rgw::sal::Attrs& attrs,
+                          RGWObjVersionTracker& objv, bool exclusive,
+                          const RGWGroupInfo* old_info) override {
+    return DAOS_NOT_IMPLEMENTED_LOG(dpp);
+  }
+  virtual int remove_group(const DoutPrefixProvider* dpp, optional_yield y,
+                           const RGWGroupInfo& info,
+                           RGWObjVersionTracker& objv) override {
+    return DAOS_NOT_IMPLEMENTED_LOG(dpp);
+  }
+  virtual int list_group_users(const DoutPrefixProvider* dpp,
+                               optional_yield y,
+                               std::string_view group_id,
+                               std::string_view path_prefix,
+                               std::string_view marker, uint32_t max_items,
+                               UserList& listing) override {
+    return DAOS_NOT_IMPLEMENTED_LOG(dpp);
+  }
+  virtual int count_account_groups(const DoutPrefixProvider* dpp,
+                                   optional_yield y,
+                                   std::string_view account_id,
+                                   uint32_t& count) override {
+    return DAOS_NOT_IMPLEMENTED_LOG(dpp);
+  }
+  virtual int list_account_groups(const DoutPrefixProvider* dpp,
+                                  optional_yield y,
+                                  std::string_view account_id,
+                                  std::string_view path_prefix,
+                                  std::string_view marker, uint32_t max_items,
+                                  GroupList& listing) override {
+    return DAOS_NOT_IMPLEMENTED_LOG(dpp);
+  }
+  virtual int list_account_topics(const DoutPrefixProvider* dpp,
+                                  optional_yield y,
+                                  std::string_view account_id,
+                                  std::string_view marker,
+                                  uint32_t max_items,
+                                  TopicList& listing) override {
+    return DAOS_NOT_IMPLEMENTED_LOG(dpp);
+  }
+  virtual int add_persistent_topic(const DoutPrefixProvider* dpp,
+                                   optional_yield y,
+                                   const std::string& topic_queue) override {
+    return DAOS_NOT_IMPLEMENTED_LOG(dpp);
+  }
+  virtual int remove_persistent_topic(const DoutPrefixProvider* dpp,
+                                      optional_yield y,
+                                      const std::string& topic_queue) override {
+    return DAOS_NOT_IMPLEMENTED_LOG(dpp);
+  }
   virtual int trim_all_usage(const DoutPrefixProvider* dpp,
                              uint64_t start_epoch, uint64_t end_epoch,
                              optional_yield y) override;
