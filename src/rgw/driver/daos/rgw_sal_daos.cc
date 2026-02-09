@@ -904,7 +904,8 @@ const std::string& DaosZone::get_current_period_id() {
 }
 
 std::unique_ptr<LuaManager> DaosStore::get_lua_manager(const DoutPrefixProvider *dpp, const std::string& luarocks_path) {
-  return std::make_unique<DaosLuaManager>(this, dpp, luarocks_path);
+  // DAOS Lua manager is not implemented; return basic instance to satisfy interface
+  return std::make_unique<DaosLuaManager>(this);
 }
 
 int DaosObject::load_obj_state(const DoutPrefixProvider* dpp,
