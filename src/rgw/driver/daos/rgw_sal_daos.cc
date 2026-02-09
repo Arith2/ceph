@@ -90,6 +90,22 @@ int DaosStore::list_buckets(const DoutPrefixProvider* dpp,
   return 0;
 }
 
+int DaosStore::get_zonegroup(const std::string& id,
+                             std::unique_ptr<ZoneGroup>* zg) {
+  auto& zg_ref = static_cast<DaosZoneGroup&>(zone.get_zonegroup());
+  if (!id.empty() && id != zg_ref.get_id()) {
+    return -ENOENT;
+  }
+  zg->reset(new DaosZoneGroup(this, zg_ref.get_group()));
+  return 0;
+}
+
+int DaosStore::list_all_zones(const DoutPrefixProvider* dpp,
+                              std::list<std::string>& zone_ids) {
+  zone_ids.push_back(zone.get_id());
+  return 0;
+}
+
 int DaosUser::create_bucket(
     const DoutPrefixProvider* dpp, const rgw_bucket& b,
     const std::string& zonegroup_id, rgw_placement_rule& placement_rule,
@@ -198,6 +214,14 @@ int DaosUser::read_usage(const DoutPrefixProvider* dpp, uint64_t start_epoch,
 
 int DaosUser::trim_usage(const DoutPrefixProvider* dpp, uint64_t start_epoch,
                          uint64_t end_epoch) {
+  return DAOS_NOT_IMPLEMENTED_LOG(dpp);
+}
+
+int DaosUser::verify_mfa(const std::string& mfa_str, bool* verified,
+                         const DoutPrefixProvider* dpp, optional_yield y) {
+  if (verified) {
+    *verified = false;
+  }
   return DAOS_NOT_IMPLEMENTED_LOG(dpp);
 }
 
@@ -812,6 +836,33 @@ void DaosZoneGroup::get_placement_target_names(
   }
 }
 
+int DaosZoneGroup::get_zone_by_id(const std::string& id,
+                                  std::unique_ptr<Zone>* zone) {
+  if (group.zones.find(id) == group.zones.end()) {
+    return -ENOENT;
+  }
+  zone->reset(new DaosZone(store, *this));
+  return 0;
+}
+
+int DaosZoneGroup::get_zone_by_name(const std::string& name,
+                                    std::unique_ptr<Zone>* zone) {
+  for (const auto& [zid, zinfo] : group.zones) {
+    if (zinfo.name == name) {
+      zone->reset(new DaosZone(store, *this));
+      return 0;
+    }
+  }
+  return -ENOENT;
+}
+
+int DaosZoneGroup::list_zones(std::list<std::string>& zone_ids) {
+  for (const auto& [id, _] : group.zones) {
+    zone_ids.push_back(id.id);
+  }
+  return 0;
+}
+
 int DaosZoneGroup::get_placement_tier(const rgw_placement_rule& rule,
                                       std::unique_ptr<PlacementTier>* tier) {
   std::map<std::string, RGWZoneGroupPlacementTarget>::const_iterator titer;
@@ -838,17 +889,7 @@ int DaosZoneGroup::get_placement_tier(const rgw_placement_rule& rule,
 
 ZoneGroup& DaosZone::get_zonegroup() { return zonegroup; }
 
-int DaosZone::get_zonegroup(const std::string& id,
-                            std::unique_ptr<ZoneGroup>* group) {
-  /* XXX: for now only one zonegroup supported */
-  ZoneGroup* zg;
-  zg = new DaosZoneGroup(store, zonegroup.get_group());
-
-  group->reset(zg);
-  return 0;
-}
-
-const rgw_zone_id& DaosZone::get_id() { return cur_zone_id; }
+const std::string& DaosZone::get_id() { return cur_zone_id; }
 
 const std::string& DaosZone::get_name() const {
   return zone_params->get_name();
@@ -898,6 +939,7 @@ DaosObject::~DaosObject() { close(nullptr); }
 int DaosObject::set_obj_attrs(const DoutPrefixProvider* dpp, Attrs* setattrs,
                               Attrs* delattrs, optional_yield y, uint32_t flags) {
   ldpp_dout(dpp, 20) << "DEBUG: DaosObject::set_obj_attrs()" << dendl;
+  Attrs& attrs = get_attrs();
   // TODO handle target_obj
   // Get object's metadata (those stored in rgw_bucket_dir_entry)
   rgw_bucket_dir_entry ent;
@@ -921,6 +963,7 @@ int DaosObject::set_obj_attrs(const DoutPrefixProvider* dpp, Attrs* setattrs,
 int DaosObject::get_obj_attrs(optional_yield y, const DoutPrefixProvider* dpp,
                               rgw_obj* target_obj) {
   ldpp_dout(dpp, 20) << "DEBUG: DaosObject::get_obj_attrs()" << dendl;
+  Attrs& attrs = get_attrs();
   // TODO handle target_obj
   // Get object's metadata (those stored in rgw_bucket_dir_entry)
   rgw_bucket_dir_entry ent;
@@ -933,6 +976,7 @@ int DaosObject::modify_obj_attrs(const char* attr_name, bufferlist& attr_val,
                                  const DoutPrefixProvider* dpp, uint32_t flags) {
   // Get object's metadata (those stored in rgw_bucket_dir_entry)
   ldpp_dout(dpp, 20) << "DEBUG: modify_obj_attrs" << dendl;
+  Attrs& attrs = get_attrs();
   rgw_bucket_dir_entry ent;
   int ret = get_dir_entry_attrs(dpp, &ent, &attrs);
   if (ret != 0) {
@@ -959,6 +1003,7 @@ int DaosObject::delete_obj_attrs(const DoutPrefixProvider* dpp,
 }
 
 bool DaosObject::is_expired() {
+  Attrs& attrs = get_attrs();
   auto iter = attrs.find(RGW_ATTR_DELETE_AT);
   if (iter != attrs.end()) {
     utime_t delete_at;
@@ -1408,7 +1453,7 @@ int DaosObject::set_dir_entry_attrs(const DoutPrefixProvider* dpp,
 
   if (!setattrs) {
     // if setattrs is not passed, use object attrs
-    setattrs = &attrs;
+    setattrs = &get_attrs();
   }
 
   bufferlist wbl;
@@ -1985,7 +2030,8 @@ int DaosMultipartUpload::get_info(const DoutPrefixProvider* dpp,
   auto iter = bl.cbegin();
   ent.decode(iter);
   decode(decoded_attrs, iter);
-  ldpp_dout(dpp, 20) << "DEBUG: decoded_attrs=" << attrs << dendl;
+  ldpp_dout(dpp, 20) << "DEBUG: decoded_attrs size=" << decoded_attrs.size()
+                     << dendl;
 
   if (attrs) {
     *attrs = decoded_attrs;
@@ -2010,7 +2056,8 @@ std::unique_ptr<Writer> DaosMultipartUpload::get_writer(
     const rgw_placement_rule* ptail_placement_rule, uint64_t part_num,
     const std::string& part_num_str) {
   ldpp_dout(dpp, 20) << "DaosMultipartUpload::get_writer(): enter part="
-                     << part_num << " head_obj=" << _head_obj << dendl;
+                     << part_num << " head_obj="
+                     << (obj ? obj->get_name() : std::string(\"<null>\")) << dendl;
   return std::make_unique<DaosMultipartWriter>(
       dpp, y, this, obj, store, owner, ptail_placement_rule,
       part_num, part_num_str);
@@ -2333,7 +2380,8 @@ bool DaosStore::process_expired_objects(const DoutPrefixProvider *dpp,
 
 std::unique_ptr<Notification> DaosStore::get_notification(
     rgw::sal::Object* obj, rgw::sal::Object* src_obj, struct req_state* s,
-    rgw::notify::EventType event_type, const std::string* object_name) {
+    rgw::notify::EventType event_type, optional_yield y,
+    const std::string* object_name) {
   rgw::notify::EventTypeList event_types = {event_type};
   return std::make_unique<DaosNotification>(obj, src_obj, event_types);
 }

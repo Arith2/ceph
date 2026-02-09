@@ -25,6 +25,7 @@
 #include <set>
 #include <string>
 #include <vector>
+#include <list>
 
 #include "rgw_multi.h"
 #include "rgw_notify.h"
@@ -194,6 +195,8 @@ class DaosUser : public StoreUser {
       std::map<rgw_user_bucket, rgw_usage_log_entry>& usage) override;
   virtual int trim_usage(const DoutPrefixProvider* dpp, uint64_t start_epoch,
                          uint64_t end_epoch) override;
+  virtual int verify_mfa(const std::string& mfa_str, bool* verified,
+                         const DoutPrefixProvider* dpp, optional_yield y) override;
 
   virtual int load_user(const DoutPrefixProvider* dpp,
                         optional_yield y) override;
@@ -412,6 +415,11 @@ class DaosZoneGroup : public StoreZoneGroup {
   };
   virtual void get_placement_target_names(
       std::set<std::string>& names) const override;
+  virtual int get_zone_by_id(const std::string& id,
+                             std::unique_ptr<Zone>* zone) override;
+  virtual int get_zone_by_name(const std::string& name,
+                               std::unique_ptr<Zone>* zone) override;
+  virtual int list_zones(std::list<std::string>& zone_ids) override;
   virtual const std::string& get_default_placement_name() const override {
     return group.default_placement.name;
   };
@@ -443,7 +451,7 @@ class DaosZone : public StoreZone {
   RGWZoneParams* zone_params{
       nullptr}; /* internal zone params, e.g., rados pools */
   RGWPeriod* current_period{nullptr};
-  rgw_zone_id cur_zone_id;
+  std::string cur_zone_id;
 
  public:
   DaosZone(DaosStore* _store) : store(_store), zonegroup(_store) {
@@ -451,7 +459,7 @@ class DaosZone : public StoreZone {
     zone_public_config = new RGWZone();
     zone_params = new RGWZoneParams();
     current_period = new RGWPeriod();
-    cur_zone_id = rgw_zone_id(zone_params->get_id());
+    cur_zone_id = zone_params->get_id();
 
     // XXX: only default and STANDARD supported for now
     RGWZonePlacementInfo info;
@@ -466,7 +474,7 @@ class DaosZone : public StoreZone {
     zone_public_config = new RGWZone();
     zone_params = new RGWZoneParams();
     current_period = new RGWPeriod();
-    cur_zone_id = rgw_zone_id(zone_params->get_id());
+    cur_zone_id = zone_params->get_id();
 
     // XXX: only default and STANDARD supported for now
     RGWZonePlacementInfo info;
@@ -481,9 +489,7 @@ class DaosZone : public StoreZone {
     return std::make_unique<DaosZone>(store);
   }
   virtual ZoneGroup& get_zonegroup() override;
-  virtual int get_zonegroup(const std::string& id,
-                            std::unique_ptr<ZoneGroup>* zonegroup) override;
-  virtual const rgw_zone_id& get_id() override;
+  virtual const std::string& get_id() override;
   virtual const std::string& get_name() const override;
   virtual bool is_writeable() override;
   virtual bool get_redirect_endpoint(std::string* endpoint) override;
@@ -494,6 +500,9 @@ class DaosZone : public StoreZone {
   virtual const std::string& get_realm_name() { return realm->get_name(); }
   virtual const std::string& get_realm_id() { return realm->get_id(); }
   virtual const std::string_view get_tier_type() { return "rgw"; }
+  virtual RGWBucketSyncPolicyHandlerRef get_sync_policy_handler() override {
+    return nullptr;
+  }
 
   friend class DaosStore;
 };
@@ -924,6 +933,10 @@ class DaosStore : public StoreDriver {
   int load_bucket(const DoutPrefixProvider* dpp, User* u,
                   const rgw_bucket& b, std::unique_ptr<Bucket>* bucket,
                   optional_yield y) override;
+  virtual int get_zonegroup(const std::string& id,
+                            std::unique_ptr<ZoneGroup>* zonegroup) override;
+  virtual int list_all_zones(const DoutPrefixProvider* dpp,
+                             std::list<std::string>& zone_ids) override;
   int list_buckets(const DoutPrefixProvider* dpp,
                    const rgw_owner& owner, const std::string& tenant,
                    const std::string& marker, const std::string& end_marker,
@@ -1021,6 +1034,7 @@ class DaosStore : public StoreDriver {
   virtual std::string get_host_id() { return ""; }
 
   std::unique_ptr<LuaManager> get_lua_manager(const DoutPrefixProvider *dpp = nullptr, const std::string& luarocks_path = "") override;
+  virtual void register_admin_apis(RGWRESTMgr* mgr) override {}
   virtual std::unique_ptr<RGWRole> get_role(
       std::string name, std::string tenant, rgw_account_id account_id, std::string path = "",
       std::string trust_policy = "", std::string description = "", std::string max_session_duration_str = "",

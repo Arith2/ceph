@@ -1893,14 +1893,28 @@ print('created new bucket')" > "$CEPH_OUT_DIR/$rgw_python_file"
 
 do_rgw_create_users()
 {
+    remove_user_if_exists() {
+        local uid="$1"
+        local tenant="$2"
+        local tenant_opt=""
+        [ -n "$tenant" ] && tenant_opt="--tenant $tenant"
+
+        if $CEPH_BIN/radosgw-admin user info --uid "$uid" $tenant_opt -c $conf_fn >/dev/null 2>&1; then
+            debug echo "removing existing user $uid${tenant:+ (tenant=$tenant)}"
+            $CEPH_BIN/radosgw-admin user rm --uid "$uid" $tenant_opt --purge-data -c $conf_fn >/dev/null
+        fi
+    }
+
     # Create S3 user
     s3_akey='0555b35654ad1656d804'
     s3_skey='h7GhxuBLTrlhVUyxSPUKUV8r/2EI4ngqJxD7iBdBYLhwluN30JaT3Q=='
+    remove_user_if_exists testid
     debug echo "setting up user testid"
     $CEPH_BIN/radosgw-admin user create --uid testid --access-key $s3_akey --secret $s3_skey --display-name 'M. Tester' --email tester@ceph.com -c $conf_fn > /dev/null
 
     # Create S3-test users
     # See: https://github.com/ceph/s3-tests
+    remove_user_if_exists 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
     debug echo "setting up s3-test users"
 
     $CEPH_BIN/radosgw-admin user create \
@@ -1909,12 +1923,14 @@ do_rgw_create_users()
         --secret abcdefghijklmnopqrstuvwxyzabcdefghijklmn \
         --display-name youruseridhere \
         --email s3@example.com --caps="roles=*;user-policy=*;oidc-provider=*" -c $conf_fn > /dev/null
+    remove_user_if_exists 56789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234
     $CEPH_BIN/radosgw-admin user create \
         --uid 56789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234 \
         --access-key NOPQRSTUVWXYZABCDEFG \
         --secret nopqrstuvwxyzabcdefghijklmnabcdefghijklm \
         --display-name john.doe \
         --email john.doe@example.com -c $conf_fn > /dev/null
+    remove_user_if_exists 9876543210abcdef0123456789abcdef0123456789abcdef0123456789abcdef testx
     $CEPH_BIN/radosgw-admin user create \
 	--tenant testx \
         --uid 9876543210abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
@@ -1945,20 +1961,20 @@ do_rgw_create_users()
             --policy-arn arn:aws:iam::aws:policy/AmazonS3FullAccess -c $conf_fn > /dev/null
     fi
 
-    # Create Swift user
-    debug echo "setting up user tester"
-    $CEPH_BIN/radosgw-admin user create -c $conf_fn --subuser=test:tester --display-name=Tester-Subuser --key-type=swift --secret=testing --access=full > /dev/null
+    # # Create Swift user
+    # debug echo "setting up user tester"
+    # $CEPH_BIN/radosgw-admin user create -c $conf_fn --subuser=test:tester --display-name=Tester-Subuser --key-type=swift --secret=testing --access=full > /dev/null
 
     echo ""
     echo "S3 User Info:"
     echo "  access key:  $s3_akey"
     echo "  secret key:  $s3_skey"
     echo ""
-    echo "Swift User Info:"
-    echo "  account   : test"
-    echo "  user      : tester"
-    echo "  password  : testing"
-    echo ""
+    # echo "Swift User Info:"
+    # echo "  account   : test"
+    # echo "  user      : tester"
+    # echo "  password  : testing"
+    # echo ""
 }
 
 do_rgw()
