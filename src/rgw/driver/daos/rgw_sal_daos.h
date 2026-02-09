@@ -537,6 +537,11 @@ class DaosLuaManager : public StoreLuaManager {
     DAOS_NOT_IMPLEMENTED_LOG(dpp);
     return -ENOENT;
   };
+  virtual int reload_packages(const DoutPrefixProvider* dpp,
+                              optional_yield y) override {
+    DAOS_NOT_IMPLEMENTED_LOG(dpp);
+    return -ENOTSUP;
+  }
 };
 
 class DaosObject : public StoreObject {
@@ -733,7 +738,7 @@ class MPDaosSerializer : public StoreMPSerializer {
 class DaosAtomicWriter : public StoreWriter {
  protected:
   rgw::sal::DaosStore* store;
-  const ACLOwner& owner;
+  ACLOwner owner;
   const rgw_placement_rule* ptail_placement_rule;
   uint64_t olh_epoch;
   const std::string& unique_tag;
@@ -743,7 +748,7 @@ class DaosAtomicWriter : public StoreWriter {
  public:
   DaosAtomicWriter(const DoutPrefixProvider* dpp, optional_yield y,
                    rgw::sal::Object* obj,
-                   DaosStore* _store, const rgw_user& _owner,
+                   DaosStore* _store, const ACLOwner& _owner,
                    const rgw_placement_rule* _ptail_placement_rule,
                    uint64_t _olh_epoch, const std::string& _unique_tag);
   ~DaosAtomicWriter() = default;
@@ -1006,7 +1011,8 @@ class DaosStore : public StoreDriver {
   virtual int read_all_usage(
       const DoutPrefixProvider* dpp, uint64_t start_epoch, uint64_t end_epoch,
       uint32_t max_entries, bool* is_truncated, RGWUsageIter& usage_iter,
-      std::map<rgw_user_bucket, rgw_usage_log_entry>& usage) override;
+      std::map<rgw_user_bucket, rgw_usage_log_entry>& usage,
+      optional_yield y) override;
   virtual int trim_all_usage(const DoutPrefixProvider* dpp,
                              uint64_t start_epoch, uint64_t end_epoch,
                              optional_yield y) override;

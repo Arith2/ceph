@@ -54,7 +54,7 @@ int DaosStore::list_buckets(const DoutPrefixProvider* dpp,
                      << " end_marker=" << end_marker << " max=" << max << dendl;
   int ret = 0;
   bool is_truncated = false;
-  buckets.clear();
+  buckets.buckets.clear();
   vector<struct ds3_bucket_info> bucket_infos(max);
   daos_size_t bcount = bucket_infos.size();
   vector<vector<uint8_t>> values(bcount, vector<uint8_t>(DS3_MAX_ENCODED_LEN));
@@ -83,10 +83,18 @@ int DaosStore::list_buckets(const DoutPrefixProvider* dpp,
     bl.append(reinterpret_cast<char*>(bi.encoded), bi.encoded_length);
     auto iter = bl.cbegin();
     dbinfo.decode(iter);
-    buckets.add(std::make_unique<DaosBucket>(this, dbinfo.info, this));
+    RGWBucketEnt ent;
+    ent.bucket = dbinfo.info.bucket;
+    ent.owner = dbinfo.info.owner;
+    ent.creation_time = dbinfo.info.creation_time;
+    buckets.buckets.push_back(ent);
   }
 
-  buckets.set_truncated(is_truncated);
+  if (is_truncated && !bucket_infos.empty()) {
+    buckets.next_marker = bucket_infos.back().info.bucket.name;
+  } else {
+    buckets.next_marker.clear();
+  }
   return 0;
 }
 
@@ -476,8 +484,7 @@ int DaosBucket::try_refresh_info(const DoutPrefixProvider* dpp,
 int DaosBucket::read_usage(const DoutPrefixProvider* dpp, uint64_t start_epoch,
                            uint64_t end_epoch, uint32_t max_entries,
                            bool* is_truncated, RGWUsageIter& usage_iter,
-                           map<rgw_user_bucket, rgw_usage_log_entry>& usage,
-                           optional_yield y) {
+                           map<rgw_user_bucket, rgw_usage_log_entry>& usage) {
   return DAOS_NOT_IMPLEMENTED_LOG(dpp);
 }
 
@@ -671,8 +678,9 @@ int DaosBucket::list_multiparts(
     ent.decode(iter);
     string name = ent.key.name;
 
-    ACLOwner owner(rgw_user(ent.meta.owner));
-    owner.set_name(ent.meta.owner_display_name);
+  ACLOwner owner;
+  owner.id = parse_owner(ent.meta.owner);
+  owner.display_name = ent.meta.owner_display_name;
     uploads.push_back(this->get_multipart_upload(
         name, mp.upload_id, std::move(owner), ent.meta.mtime));
   }
@@ -1433,7 +1441,7 @@ int DaosObject::mark_as_latest(const DoutPrefixProvider* dpp,
 DaosAtomicWriter::DaosAtomicWriter(
     const DoutPrefixProvider* dpp, optional_yield y,
     rgw::sal::Object* obj, DaosStore* _store,
-    const rgw_user& _owner, const rgw_placement_rule* _ptail_placement_rule,
+    const ACLOwner& _owner, const rgw_placement_rule* _ptail_placement_rule,
     uint64_t _olh_epoch, const std::string& _unique_tag)
     : StoreWriter(dpp, y),
       store(_store),
@@ -1478,9 +1486,10 @@ int DaosAtomicWriter::process(bufferlist&& data, uint64_t offset) {
 int DaosAtomicWriter::complete(
     size_t accounted_size, const std::string& etag, ceph::real_time* mtime,
     ceph::real_time set_mtime, std::map<std::string, bufferlist>& attrs,
+    const std::optional<rgw::cksum::Cksum>& cksum,
     ceph::real_time delete_at, const char* if_match, const char* if_nomatch,
     const std::string* user_data, rgw_zone_set* zones_trace, bool* canceled,
-    optional_yield y, uint32_t flags) {
+    const req_context& rctx, uint32_t flags) {
   ldpp_dout(dpp, 20) << "DEBUG: complete" << dendl;
   bufferlist bl;
   rgw_bucket_dir_entry ent;
@@ -1563,7 +1572,7 @@ int DaosMultipartUpload::init(const DoutPrefixProvider* dpp, optional_yield y,
   bufferlist bl;
   rgw_bucket_dir_entry ent;
   ent.key.name = oid;
-  ent.meta.owner = owner.get_id().to_str();
+  ent.meta.owner = owner.id.to_str();
   ent.meta.category = RGWObjCategory::MultiMeta;
   ent.meta.mtime = ceph::real_clock::now();
 
@@ -1973,7 +1982,7 @@ std::unique_ptr<Writer> DaosMultipartUpload::get_writer(
     const std::string& part_num_str) {
   ldpp_dout(dpp, 20) << "DaosMultipartUpload::get_writer(): enter part="
                      << part_num << " head_obj="
-                     << (obj ? obj->get_name() : std::string(\"<null>\")) << dendl;
+                     << (obj ? obj->get_name() : std::string("<null>")) << dendl;
   return std::make_unique<DaosMultipartWriter>(
       dpp, y, this, obj, store, owner, ptail_placement_rule,
       part_num, part_num_str);
@@ -2367,7 +2376,8 @@ RGWDataSyncStatusManager* DaosStore::get_data_sync_manager(
 int DaosStore::read_all_usage(
     const DoutPrefixProvider* dpp, uint64_t start_epoch, uint64_t end_epoch,
     uint32_t max_entries, bool* is_truncated, RGWUsageIter& usage_iter,
-    map<rgw_user_bucket, rgw_usage_log_entry>& usage) {
+    map<rgw_user_bucket, rgw_usage_log_entry>& usage,
+    optional_yield y) {
   return DAOS_NOT_IMPLEMENTED_LOG(dpp);
 }
 
