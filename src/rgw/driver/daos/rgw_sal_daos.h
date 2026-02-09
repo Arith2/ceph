@@ -1011,8 +1011,7 @@ class DaosStore : public StoreDriver {
   virtual int read_all_usage(
       const DoutPrefixProvider* dpp, uint64_t start_epoch, uint64_t end_epoch,
       uint32_t max_entries, bool* is_truncated, RGWUsageIter& usage_iter,
-      std::map<rgw_user_bucket, rgw_usage_log_entry>& usage,
-      optional_yield y) override;
+      std::map<rgw_user_bucket, rgw_usage_log_entry>& usage) override;
   virtual int trim_all_usage(const DoutPrefixProvider* dpp,
                              uint64_t start_epoch, uint64_t end_epoch,
                              optional_yield y) override;
