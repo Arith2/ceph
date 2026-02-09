@@ -979,17 +979,6 @@ int DaosObject::transition_to_cloud(
   return DAOS_NOT_IMPLEMENTED_LOG(dpp);
 }
 
-int DaosObject::restore_obj_from_cloud(Bucket* bucket,
-          rgw::sal::PlacementTier* tier,
-	  CephContext* cct,
-          std::optional<uint64_t> days,
-	  bool& in_progress,
-          const DoutPrefixProvider* dpp, 
-          optional_yield y)
-{
-  return DAOS_NOT_IMPLEMENTED_LOG(dpp);
-}
-
 int DaosObject::list_parts(const DoutPrefixProvider* dpp, CephContext* cct,
                            int num_parts, int marker, int* next_marker,
                            bool* truncated, list_parts_each_t cb,
@@ -1566,7 +1555,7 @@ int DaosMultipartUpload::init(const DoutPrefixProvider* dpp, optional_yield y,
   bufferlist bl;
   rgw_bucket_dir_entry ent;
   ent.key.name = oid;
-  ent.meta.owner = owner.id.to_str();
+  ent.meta.owner = to_string(owner.id);
   ent.meta.category = RGWObjCategory::MultiMeta;
   ent.meta.mtime = ceph::real_clock::now();
 
