@@ -1216,8 +1216,8 @@ int DaosObject::DaosReadOp::get_attr(const DoutPrefixProvider* dpp,
                                      optional_yield y) {
   Attrs attrs;
   int ret = source->get_dir_entry_attrs(dpp, nullptr, &attrs);
-  if (!ret) {
-    return -ENODATA;
+  if (ret != 0) {
+    return ret;
   }
 
   auto search = attrs.find(name);
@@ -1426,7 +1426,7 @@ int DaosObject::get_dir_entry_attrs(const DoutPrefixProvider* dpp,
     struct ds3_multipart_upload_info ui = {.encoded = value.data(),
                                            .encoded_length = size};
     ret = ds3_upload_get_info(&ui, bucket->get_name().c_str(),
-                              get_key().get_oid().c_str(), store->ds3);
+                              get_key().name.c_str(), store->ds3);
   } else {
     ret = lookup(dpp);
     if (ret != 0) {
@@ -2090,7 +2090,7 @@ int DaosMultipartWriter::prepare(optional_yield y) {
 }
 
 const std::string& DaosMultipartWriter::get_bucket_name() {
-  return static_cast<DaosMultipartUpload*>(upload)->get_bucket_name();
+  return bucket_name;
 }
 
 int DaosMultipartWriter::process(bufferlist&& data, uint64_t offset) {
@@ -2155,7 +2155,7 @@ int DaosMultipartWriter::complete(
     ldpp_dout(dpp, 0) << "ERROR: failed to set part info (" << get_bucket_name()
                       << ", " << upload_id << ", " << part_num
                       << "): ret=" << ret << dendl;
-    if (ret == ENOENT) {
+    if (ret == -ENOENT) {
       ret = -ERR_NO_SUCH_UPLOAD;
     }
   }
