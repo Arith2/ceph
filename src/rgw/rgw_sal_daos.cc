@@ -1665,6 +1665,9 @@ int DaosMultipartUpload::init(const DoutPrefixProvider* dpp, optional_yield y,
                               ACLOwner& _owner,
                               rgw_placement_rule& dest_placement,
                               rgw::sal::Attrs& attrs) {
+  ldpp_dout(dpp, 0) << "DEBUG [daos-multipart-fix-v1] DaosMultipartUpload::init()"
+                    << " upload_id=" << get_upload_id()
+                    << " bucket=" << get_bucket()->get_name() << dendl;
   ldpp_dout(dpp, 20) << "DEBUG: init" << dendl;
   int ret;
   std::string oid = mp_obj.get_key();
@@ -2079,6 +2082,10 @@ DaosMultipartWriter::~DaosMultipartWriter() {
 }
 
 int DaosMultipartWriter::prepare(optional_yield y) {
+  ldpp_dout(dpp, 0) << "DEBUG [daos-multipart-fix-v1] DaosMultipartWriter::prepare()"
+                    << " bucket=" << bucket_name
+                    << " upload_id=" << upload_id
+                    << " part=" << part_num_str << dendl;
   ldpp_dout(dpp, 20) << "DaosMultipartWriter::prepare(): enter part="
                      << part_num_str << dendl;
   int ret = ds3_part_open(get_bucket_name().c_str(), upload_id.c_str(),
