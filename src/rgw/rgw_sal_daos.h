@@ -800,7 +800,7 @@ class DaosMultipartWriter : public StoreWriter {
                       uint64_t _part_num, const std::string& part_num_str)
       : StoreWriter(dpp, y),
         store(_store),
-        bucket_name(_upload->get_bucket_name()),
+        bucket_name(obj->get_bucket()->get_name()),
         upload_id(_upload->get_upload_id()),
         part_num(_part_num),
         part_num_str(part_num_str) {}
