@@ -1689,11 +1689,12 @@ int DaosMultipartUpload::init(const DoutPrefixProvider* dpp, optional_yield y,
   encode(attrs, bl);
   encode(upload_info, bl);
 
+  std::vector<uint8_t> encoded_buf(bl.c_str(), bl.c_str() + bl.length());
   struct ds3_multipart_upload_info ui;
   std::strcpy(ui.upload_id, MULTIPART_UPLOAD_ID_PREFIX);
   std::strncpy(ui.key, oid.c_str(), sizeof(ui.key));
-  ui.encoded = bl.c_str();
-  ui.encoded_length = bl.length();
+  ui.encoded = encoded_buf.data();
+  ui.encoded_length = encoded_buf.size();
   int prefix_length = strlen(ui.upload_id);
 
   do {
