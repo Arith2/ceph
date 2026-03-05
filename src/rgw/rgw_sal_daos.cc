@@ -1667,7 +1667,7 @@ int DaosMultipartUpload::init(const DoutPrefixProvider* dpp, optional_yield y,
                               rgw::sal::Attrs& attrs) {
   ldpp_dout(dpp, 0) << "DEBUG [daos-multipart-fix-v1] DaosMultipartUpload::init()"
                     << " upload_id=" << get_upload_id()
-                    << " bucket=" << get_bucket()->get_name() << dendl;
+                    << " bucket=" << bucket->get_name() << dendl;
   ldpp_dout(dpp, 20) << "DEBUG: init" << dendl;
   int ret;
   std::string oid = mp_obj.get_key();
