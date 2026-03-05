@@ -1708,6 +1708,11 @@ int DaosMultipartUpload::init(const DoutPrefixProvider* dpp, optional_yield y,
     ret = ds3_upload_init(&ui, bucket->get_name().c_str(), store->ds3);
   } while (ret == -EEXIST);
 
+  // ADD THIS LINE:
+  ldpp_dout(dpp, 0) << "DEBUG [daos-multipart-fix-v1] DaosMultipartUpload::init() AFTER loop"
+                    << " upload_id=" << get_upload_id()
+                    << " ds3_upload_init ret=" << ret << dendl;
+
   if (ret != 0) {
     ldpp_dout(dpp, 0) << "ERROR: failed to create multipart upload dir ("
                       << bucket->get_name() << "/" << get_upload_id()
