@@ -1426,7 +1426,7 @@ int DaosObject::get_dir_entry_attrs(const DoutPrefixProvider* dpp,
     struct ds3_multipart_upload_info ui = {.encoded = value.data(),
                                            .encoded_length = size};
     ret = ds3_upload_get_info(&ui, bucket->get_name().c_str(),
-                              get_key().get_oid().c_str(), store->ds3);
+                              get_key().name.c_str(), store->ds3);
     if (ret == -ENOENT) {
       ret = -ERR_NO_SUCH_UPLOAD;
     }
