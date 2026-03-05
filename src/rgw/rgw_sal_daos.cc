@@ -986,9 +986,13 @@ int DaosObject::set_obj_attrs(const DoutPrefixProvider* dpp, Attrs* setattrs,
 int DaosObject::get_obj_attrs(optional_yield y, const DoutPrefixProvider* dpp,
                               rgw_obj* target_obj) {
   ldpp_dout(dpp, 20) << "DEBUG: DaosObject::get_obj_attrs()" << dendl;
+  // Multipart meta objects don't exist as regular objects during upload_part.
+  // Returning -ENOENT is safe — callers like get_encrypt_filter() treat
+  // missing attrs as "no encryption configured", which is correct.
+  if (get_key().ns == RGW_OBJ_NS_MULTIPART) {
+    return -ENOENT;
+  }
   Attrs& attrs = get_attrs();
-  // TODO handle target_obj
-  // Get object's metadata (those stored in rgw_bucket_dir_entry)
   rgw_bucket_dir_entry ent;
   int ret = get_dir_entry_attrs(dpp, &ent, &attrs);
   return ret;
