@@ -2024,10 +2024,10 @@ int DaosMultipartUpload::get_info(const DoutPrefixProvider* dpp,
   }
 
   // Read the multipart upload dirent from index
-  bufferlist bl;
-  uint64_t size = DS3_MAX_ENCODED_LEN;
-  struct ds3_multipart_upload_info ui = {
-      .encoded = bl.append_hole(size).c_str(), .encoded_length = size};
+  vector<uint8_t> encoded_buf(DS3_MAX_ENCODED_LEN);
+  uint64_t size = encoded_buf.size();
+  struct ds3_multipart_upload_info ui = {.encoded = encoded_buf.data(),
+                                         .encoded_length = size};
   int ret = ds3_upload_get_info(&ui, bucket->get_name().c_str(),
                                 get_upload_id().c_str(), store->ds3);
 
@@ -2037,6 +2037,9 @@ int DaosMultipartUpload::get_info(const DoutPrefixProvider* dpp,
     }
     return ret;
   }
+
+  bufferlist bl;
+  bl.append(reinterpret_cast<char*>(encoded_buf.data()), ui.encoded_length);
 
   multipart_upload_info upload_info;
   rgw_bucket_dir_entry ent;
