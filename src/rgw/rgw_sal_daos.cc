@@ -1693,7 +1693,7 @@ int DaosMultipartUpload::init(const DoutPrefixProvider* dpp, optional_yield y,
   encode(attrs, bl);
   encode(upload_info, bl);
 
-  struct ds3_multipart_upload_info ui;
+  struct ds3_multipart_upload_info ui = {};
   std::strcpy(ui.upload_id, MULTIPART_UPLOAD_ID_PREFIX);
   std::strncpy(ui.key, oid.c_str(), sizeof(ui.key));
   ui.encoded = bl.c_str();
