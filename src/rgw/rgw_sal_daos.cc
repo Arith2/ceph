@@ -2097,7 +2097,7 @@ int DaosMultipartWriter::prepare(optional_yield y) {
 }
 
 const std::string& DaosMultipartWriter::get_bucket_name() {
-  return static_cast<DaosMultipartUpload*>(upload)->get_bucket_name();
+  return bucket_name;
 }
 
 int DaosMultipartWriter::process(bufferlist&& data, uint64_t offset) {
