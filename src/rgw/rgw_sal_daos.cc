@@ -1917,10 +1917,10 @@ int DaosMultipartUpload::complete(
 
   // Different from rgw_sal_rados.cc starts here
   // Read the object's multipart info
-  bufferlist bl;
-  uint64_t size = DS3_MAX_ENCODED_LEN;
-  struct ds3_multipart_upload_info ui = {
-      .encoded = bl.append_hole(size).c_str(), .encoded_length = size};
+  vector<uint8_t> encoded_buf(DS3_MAX_ENCODED_LEN);
+  uint64_t size = encoded_buf.size();
+  struct ds3_multipart_upload_info ui = {.encoded = encoded_buf.data(),
+                                         .encoded_length = size};
   ret = ds3_upload_get_info(&ui, bucket->get_name().c_str(),
                             get_upload_id().c_str(), store->ds3);
   ldpp_dout(dpp, 20) << "DEBUG: ds3_upload_get_info entry="
@@ -1931,6 +1931,9 @@ int DaosMultipartUpload::complete(
     }
     return ret;
   }
+
+  bufferlist bl;
+  bl.append(reinterpret_cast<char*>(encoded_buf.data()), ui.encoded_length);
 
   rgw_bucket_dir_entry ent;
   auto iter = bl.cbegin();
