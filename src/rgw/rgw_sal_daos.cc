@@ -986,9 +986,13 @@ int DaosObject::set_obj_attrs(const DoutPrefixProvider* dpp, Attrs* setattrs,
 int DaosObject::get_obj_attrs(optional_yield y, const DoutPrefixProvider* dpp,
                               rgw_obj* target_obj) {
   ldpp_dout(dpp, 20) << "DEBUG: DaosObject::get_obj_attrs()" << dendl;
+  // Multipart meta objects don't exist as regular objects during upload_part.
+  // Returning -ENOENT is safe — callers like get_encrypt_filter() treat
+  // missing attrs as "no encryption configured", which is correct.
+  if (get_key().ns == RGW_OBJ_NS_MULTIPART) {
+    return -ENOENT;
+  }
   Attrs& attrs = get_attrs();
-  // TODO handle target_obj
-  // Get object's metadata (those stored in rgw_bucket_dir_entry)
   rgw_bucket_dir_entry ent;
   int ret = get_dir_entry_attrs(dpp, &ent, &attrs);
   return ret;
@@ -1216,8 +1220,8 @@ int DaosObject::DaosReadOp::get_attr(const DoutPrefixProvider* dpp,
                                      optional_yield y) {
   Attrs attrs;
   int ret = source->get_dir_entry_attrs(dpp, nullptr, &attrs);
-  if (!ret) {
-    return -ENODATA;
+  if (ret != 0) {
+    return ret;
   }
 
   auto search = attrs.find(name);
@@ -1427,9 +1431,6 @@ int DaosObject::get_dir_entry_attrs(const DoutPrefixProvider* dpp,
                                            .encoded_length = size};
     ret = ds3_upload_get_info(&ui, bucket->get_name().c_str(),
                               get_key().name.c_str(), store->ds3);
-    if (ret == -ENOENT) {
-      ret = -ERR_NO_SUCH_UPLOAD;
-    }
   } else {
     ret = lookup(dpp);
     if (ret != 0) {
@@ -1655,12 +1656,8 @@ int DaosMultipartUpload::abort(const DoutPrefixProvider* dpp,
                                CephContext* cct) {
   // Remove upload from bucket multipart index
   ldpp_dout(dpp, 20) << "DEBUG: abort" << dendl;
-  int ret = ds3_upload_remove(bucket->get_name().c_str(), get_upload_id().c_str(),
-                              store->ds3);
-  if (ret == -ENOENT) {
-    ret = -ERR_NO_SUCH_UPLOAD;
-  }
-  return ret;
+  return ds3_upload_remove(bucket->get_name().c_str(), get_upload_id().c_str(),
+                           store->ds3);
 }
 
 std::unique_ptr<rgw::sal::Object> DaosMultipartUpload::get_meta_obj() {
@@ -1672,6 +1669,9 @@ int DaosMultipartUpload::init(const DoutPrefixProvider* dpp, optional_yield y,
                               ACLOwner& _owner,
                               rgw_placement_rule& dest_placement,
                               rgw::sal::Attrs& attrs) {
+  ldpp_dout(dpp, 0) << "DEBUG [daos-multipart-fix-v1] DaosMultipartUpload::init()"
+                    << " upload_id=" << get_upload_id()
+                    << " bucket=" << bucket->get_name() << dendl;
   ldpp_dout(dpp, 20) << "DEBUG: init" << dendl;
   int ret;
   std::string oid = mp_obj.get_key();
@@ -1693,11 +1693,12 @@ int DaosMultipartUpload::init(const DoutPrefixProvider* dpp, optional_yield y,
   encode(attrs, bl);
   encode(upload_info, bl);
 
-  struct ds3_multipart_upload_info ui = {};
+  std::vector<uint8_t> encoded_buf(bl.c_str(), bl.c_str() + bl.length());
+  struct ds3_multipart_upload_info ui;
   std::strcpy(ui.upload_id, MULTIPART_UPLOAD_ID_PREFIX);
   std::strncpy(ui.key, oid.c_str(), sizeof(ui.key));
-  ui.encoded = bl.c_str();
-  ui.encoded_length = bl.length();
+  ui.encoded = encoded_buf.data();
+  ui.encoded_length = encoded_buf.size();
   int prefix_length = strlen(ui.upload_id);
 
   do {
@@ -1707,10 +1708,20 @@ int DaosMultipartUpload::init(const DoutPrefixProvider* dpp, optional_yield y,
     ret = ds3_upload_init(&ui, bucket->get_name().c_str(), store->ds3);
   } while (ret == -EEXIST);
 
+  // ADD THIS LINE:
+  ldpp_dout(dpp, 0) << "DEBUG [daos-multipart-fix-v1] DaosMultipartUpload::init() AFTER loop"
+                    << " upload_id=" << get_upload_id()
+                    << " ds3_upload_init ret=" << ret << dendl;
+
   if (ret != 0) {
     ldpp_dout(dpp, 0) << "ERROR: failed to create multipart upload dir ("
                       << bucket->get_name() << "/" << get_upload_id()
                       << "): ret=" << ret << dendl;
+  } else {
+    // Cache placement rule so get_info() can return early without
+    // calling ds3_upload_get_info() for each upload_part request,
+    // working around a crash in libdaos 2.7.x daos_obj_fetch.
+    placement = dest_placement;
   }
   return ret;
 }
@@ -1920,10 +1931,10 @@ int DaosMultipartUpload::complete(
 
   // Different from rgw_sal_rados.cc starts here
   // Read the object's multipart info
-  bufferlist bl;
-  uint64_t size = DS3_MAX_ENCODED_LEN;
-  struct ds3_multipart_upload_info ui = {
-      .encoded = bl.append_hole(size).c_str(), .encoded_length = size};
+  vector<uint8_t> encoded_buf(DS3_MAX_ENCODED_LEN);
+  uint64_t size = encoded_buf.size();
+  struct ds3_multipart_upload_info ui = {.encoded = encoded_buf.data(),
+                                         .encoded_length = size};
   ret = ds3_upload_get_info(&ui, bucket->get_name().c_str(),
                             get_upload_id().c_str(), store->ds3);
   ldpp_dout(dpp, 20) << "DEBUG: ds3_upload_get_info entry="
@@ -1934,6 +1945,9 @@ int DaosMultipartUpload::complete(
     }
     return ret;
   }
+
+  bufferlist bl;
+  bl.append(reinterpret_cast<char*>(encoded_buf.data()), ui.encoded_length);
 
   rgw_bucket_dir_entry ent;
   auto iter = bl.cbegin();
@@ -2028,10 +2042,10 @@ int DaosMultipartUpload::get_info(const DoutPrefixProvider* dpp,
   }
 
   // Read the multipart upload dirent from index
-  bufferlist bl;
-  uint64_t size = DS3_MAX_ENCODED_LEN;
-  struct ds3_multipart_upload_info ui = {
-      .encoded = bl.append_hole(size).c_str(), .encoded_length = size};
+  vector<uint8_t> encoded_buf(DS3_MAX_ENCODED_LEN);
+  uint64_t size = encoded_buf.size();
+  struct ds3_multipart_upload_info ui = {.encoded = encoded_buf.data(),
+                                         .encoded_length = size};
   int ret = ds3_upload_get_info(&ui, bucket->get_name().c_str(),
                                 get_upload_id().c_str(), store->ds3);
 
@@ -2041,6 +2055,9 @@ int DaosMultipartUpload::get_info(const DoutPrefixProvider* dpp,
     }
     return ret;
   }
+
+  bufferlist bl;
+  bl.append(reinterpret_cast<char*>(encoded_buf.data()), ui.encoded_length);
 
   multipart_upload_info upload_info;
   rgw_bucket_dir_entry ent;
@@ -2086,6 +2103,10 @@ DaosMultipartWriter::~DaosMultipartWriter() {
 }
 
 int DaosMultipartWriter::prepare(optional_yield y) {
+  ldpp_dout(dpp, 0) << "DEBUG [daos-multipart-fix-v1] DaosMultipartWriter::prepare()"
+                    << " bucket=" << bucket_name
+                    << " upload_id=" << upload_id
+                    << " part=" << part_num_str << dendl;
   ldpp_dout(dpp, 20) << "DaosMultipartWriter::prepare(): enter part="
                      << part_num_str << dendl;
   int ret = ds3_part_open(get_bucket_name().c_str(), upload_id.c_str(),
@@ -2162,7 +2183,7 @@ int DaosMultipartWriter::complete(
     ldpp_dout(dpp, 0) << "ERROR: failed to set part info (" << get_bucket_name()
                       << ", " << upload_id << ", " << part_num
                       << "): ret=" << ret << dendl;
-    if (ret == ENOENT) {
+    if (ret == -ENOENT) {
       ret = -ERR_NO_SUCH_UPLOAD;
     }
   }
