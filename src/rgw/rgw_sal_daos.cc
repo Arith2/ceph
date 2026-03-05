@@ -1708,6 +1708,11 @@ int DaosMultipartUpload::init(const DoutPrefixProvider* dpp, optional_yield y,
     ldpp_dout(dpp, 0) << "ERROR: failed to create multipart upload dir ("
                       << bucket->get_name() << "/" << get_upload_id()
                       << "): ret=" << ret << dendl;
+  } else {
+    // Cache placement rule so get_info() can return early without
+    // calling ds3_upload_get_info() for each upload_part request,
+    // working around a crash in libdaos 2.7.x daos_obj_fetch.
+    placement = dest_placement;
   }
   return ret;
 }
