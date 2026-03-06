@@ -787,6 +787,7 @@ class DaosMultipartWriter : public StoreWriter {
   const uint64_t part_num;
   const std::string part_num_str;
   uint64_t actual_part_size = 0;
+  bufferlist pending_data;
 
   ds3_part_t* ds3p = nullptr;
   bool is_open() { return ds3p != nullptr; };

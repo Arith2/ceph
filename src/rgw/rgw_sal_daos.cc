@@ -1960,8 +1960,13 @@ int DaosMultipartUpload::complete(
     return ret;
   }
 
-  // Copy data from parts to object
-  uint64_t write_off = 0;
+  // Copy data from parts to object.
+  // Workaround for libdaos 2.7.x DAOS_COND_AKEY_FETCH bug: writing each part
+  // at a non-zero offset creates multiple distinct DAOS array entries, and
+  // subsequent reads at offsets beyond the first entry trigger daos_obj_fetch()
+  // which hangs/times out. Writing all parts as a single contiguous bufferlist
+  // at offset 0 creates one entry, so reads at any offset work correctly.
+  bufferlist combined_bl;
   for (auto const& [part_num, part] : get_parts()) {
     ds3_part_t* ds3p;
     ret = ds3_part_open(get_bucket_name().c_str(), get_upload_id().c_str(),
@@ -1975,18 +1980,20 @@ int DaosMultipartUpload::complete(
     bufferlist bl;
     ret = ds3_part_read(bl.append_hole(size).c_str(), 0, &size, ds3p,
                         store->ds3, nullptr);
+    ds3_part_close(ds3p);
     if (ret != 0) {
-      ds3_part_close(ds3p);
       return ret;
     }
 
     ldpp_dout(dpp, 20) << "DaosMultipartUpload::complete(): part " << part_num
                        << " size is " << size << dendl;
+    combined_bl.claim_append(bl);
+  }
 
-    // write to obj
-    obj->write(dpp, std::move(bl), write_off);
-    ds3_part_close(ds3p);
-    write_off += part->get_size();
+  // Single write at offset 0 for the entire object
+  ret = obj->write(dpp, std::move(combined_bl), 0);
+  if (ret != 0) {
+    return ret;
   }
 
   // Set attributes
@@ -2118,18 +2125,13 @@ int DaosMultipartWriter::process(bufferlist&& data, uint64_t offset) {
     return 0;
   }
 
-  uint64_t size = data.length();
-  int ret =
-      ds3_part_write(data.c_str(), offset, &size, ds3p, store->ds3, nullptr);
-  if (ret == 0) {
-    // XXX: Combine multiple streams into one as motr does
-    actual_part_size += size;
-  } else {
-    ldpp_dout(dpp, 0) << "ERROR: failed to write into part ("
-                      << get_bucket_name() << ", " << upload_id << ", "
-                      << part_num << "): ret=" << ret << dendl;
-  }
-  return ret;
+  // Buffer data to write as a single contiguous write in complete(),
+  // working around the libdaos 2.7.x DAOS_COND_AKEY_FETCH bug which causes
+  // reads at non-zero offsets to fail when parts are written as multiple
+  // separate chunks via ds3_part_write.
+  actual_part_size += data.length();
+  pending_data.claim_append(data);
+  return 0;
 }
 
 int DaosMultipartWriter::complete(
@@ -2162,6 +2164,21 @@ int DaosMultipartWriter::complete(
   encode(attrs, bl);
   ldpp_dout(dpp, 20) << "DaosMultipartWriter::complete(): entry size"
                      << bl.length() << dendl;
+
+  // Write all buffered data as a single contiguous write at offset 0.
+  // This avoids the libdaos 2.7.x DAOS_COND_AKEY_FETCH bug where
+  // ds3_part_read at non-zero offsets within a part hangs/returns 0 bytes.
+  if (pending_data.length() > 0) {
+    uint64_t data_size = pending_data.length();
+    ret = ds3_part_write(pending_data.c_str(), 0, &data_size, ds3p,
+                         store->ds3, nullptr);
+    if (ret != 0) {
+      ldpp_dout(dpp, 0) << "ERROR: failed to write part data ("
+                        << get_bucket_name() << ", " << upload_id << ", "
+                        << part_num << "): ret=" << ret << dendl;
+      return ret;
+    }
+  }
 
   struct ds3_multipart_part_info part_info = {.part_num = part_num,
                                               .encoded = bl.c_str(),
