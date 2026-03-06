@@ -1931,28 +1931,11 @@ int DaosMultipartUpload::complete(
   }
 
   // Different from rgw_sal_rados.cc starts here
-  // Read the object's multipart info
-  vector<uint8_t> encoded_buf(DS3_MAX_ENCODED_LEN);
-  uint64_t size = encoded_buf.size();
-  struct ds3_multipart_upload_info ui = {.encoded = encoded_buf.data(),
-                                         .encoded_length = size};
-  ret = ds3_upload_get_info(&ui, bucket->get_name().c_str(),
-                            get_upload_id().c_str(), store->ds3);
-  ldpp_dout(dpp, 20) << "DEBUG: ds3_upload_get_info entry="
-                     << bucket->get_name() << "/" << get_upload_id() << dendl;
-  if (ret != 0) {
-    if (ret == -ENOENT) {
-      ret = -ERR_NO_SUCH_UPLOAD;
-    }
-    return ret;
-  }
-
-  bufferlist bl;
-  bl.append(reinterpret_cast<char*>(encoded_buf.data()), ui.encoded_length);
-
+  // Avoid calling ds3_upload_get_info() here — it calls daos_obj_fetch()
+  // which crashes in libdaos 2.7.x (DAOS_COND_AKEY_FETCH bug). All ent
+  // fields are overwritten explicitly below; owner comes from the parameter.
   rgw_bucket_dir_entry ent;
-  auto iter = bl.cbegin();
-  ent.decode(iter);
+  ent.meta.owner = owner.get_id().to_str();
 
   // Update entry data and name
   target_obj->get_key().get_index_key(&ent.key);
