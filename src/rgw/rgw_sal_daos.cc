@@ -18,6 +18,7 @@
 #include "rgw_sal_daos.h"
 
 #include <errno.h>
+#include <iomanip>
 #include <stdlib.h>
 #include <unistd.h>
 
@@ -1413,10 +1414,27 @@ int DaosObject::read(const DoutPrefixProvider* dpp, bufferlist& data,
   // Workaround for libdaos 2.7.x bug: ds3_obj_read at non-zero offset
   // ignores the offset and returns data from the start of the object.
   // Always read from offset 0 and extract the requested subrange.
+  uint64_t req_size = size;
   uint64_t full_size = offset + size;
   bufferlist full_bl;
   int ret = ds3_obj_read(full_bl.append_hole(full_size).c_str(), 0, &full_size,
                          get_daos_bucket()->ds3b, ds3o, nullptr);
+  // Debug: log what ds3_obj_read returned and sample bytes
+  {
+    const unsigned char* p = (const unsigned char*)full_bl.c_str();
+    uint64_t a0 = (full_size >= 8) ?
+      ((uint64_t)p[0]<<56|(uint64_t)p[1]<<48|(uint64_t)p[2]<<40|(uint64_t)p[3]<<32|
+       (uint64_t)p[4]<<24|(uint64_t)p[5]<<16|(uint64_t)p[6]<<8|(uint64_t)p[7]) : 0;
+    uint64_t aoff = (full_size >= offset + 8) ?
+      ((uint64_t)p[offset]<<56|(uint64_t)p[offset+1]<<48|(uint64_t)p[offset+2]<<40|
+       (uint64_t)p[offset+3]<<32|(uint64_t)p[offset+4]<<24|(uint64_t)p[offset+5]<<16|
+       (uint64_t)p[offset+6]<<8|(uint64_t)p[offset+7]) : 0;
+    ldpp_dout(dpp, 0) << "DEBUG read: offset=" << offset
+                      << " req=" << req_size << " full_size_returned=" << full_size
+                      << " bl[0..7]=0x" << std::hex << std::setfill('0') << std::setw(16) << a0
+                      << " bl[off..off+7]=0x" << std::setw(16) << aoff
+                      << std::dec << dendl;
+  }
   if (ret != 0) {
     ldpp_dout(dpp, 0) << "ERROR: failed to read from daos object ("
                       << get_bucket()->get_name() << ", " << get_key().get_oid()
