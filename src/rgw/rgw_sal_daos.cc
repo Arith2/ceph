@@ -2019,10 +2019,22 @@ int DaosMultipartUpload::complete(
       return ret;
     }
 
-    ldpp_dout(dpp, 0) << "DEBUG [daos-multipart-fix-v1] complete() part="
-                      << part_num << " expected=" << expected_size
-                      << " actual_read=" << size
-                      << " bl.length()=" << bl.length() << dendl;
+    {
+      const unsigned char* p = (const unsigned char*)bl.c_str();
+      auto rd8 = [&](uint64_t off) -> uint64_t {
+        if (size < off + 8) return 0;
+        return ((uint64_t)p[off]<<56|(uint64_t)p[off+1]<<48|(uint64_t)p[off+2]<<40|
+                (uint64_t)p[off+3]<<32|(uint64_t)p[off+4]<<24|(uint64_t)p[off+5]<<16|
+                (uint64_t)p[off+6]<<8|(uint64_t)p[off+7]);
+      };
+      ldpp_dout(dpp, 0) << "DEBUG [complete-read] part=" << part_num
+                        << " sz=" << size
+                        << " bl[0MB]=0x" << std::hex << std::setfill('0') << std::setw(16) << rd8(0)
+                        << " bl[1MB]=0x" << std::setw(16) << rd8(1048576)
+                        << " bl[2MB]=0x" << std::setw(16) << rd8(2097152)
+                        << " bl[4MB]=0x" << std::setw(16) << rd8(4194304)
+                        << std::dec << dendl;
+    }
     combined_bl.claim_append(bl);
   }
 
@@ -2206,6 +2218,22 @@ int DaosMultipartWriter::complete(
   // ds3_part_read at non-zero offsets within a part hangs/returns 0 bytes.
   if (pending_data.length() > 0) {
     uint64_t data_size = pending_data.length();
+    {
+      const unsigned char* p = (const unsigned char*)pending_data.c_str();
+      auto rd8 = [&](uint64_t off) -> uint64_t {
+        if (data_size < off + 8) return 0;
+        return ((uint64_t)p[off]<<56|(uint64_t)p[off+1]<<48|(uint64_t)p[off+2]<<40|
+                (uint64_t)p[off+3]<<32|(uint64_t)p[off+4]<<24|(uint64_t)p[off+5]<<16|
+                (uint64_t)p[off+6]<<8|(uint64_t)p[off+7]);
+      };
+      ldpp_dout(dpp, 0) << "DEBUG [writer-write] part=" << part_num
+                        << " sz=" << data_size
+                        << " pd[0MB]=0x" << std::hex << std::setfill('0') << std::setw(16) << rd8(0)
+                        << " pd[1MB]=0x" << std::setw(16) << rd8(1048576)
+                        << " pd[2MB]=0x" << std::setw(16) << rd8(2097152)
+                        << " pd[4MB]=0x" << std::setw(16) << rd8(4194304)
+                        << std::dec << dendl;
+    }
     ret = ds3_part_write(pending_data.c_str(), 0, &data_size, ds3p,
                          store->ds3, nullptr);
     if (ret != 0) {
