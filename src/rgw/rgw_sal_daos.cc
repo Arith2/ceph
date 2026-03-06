@@ -1407,13 +1407,28 @@ int DaosObject::write(const DoutPrefixProvider* dpp, bufferlist&& data,
 
 int DaosObject::read(const DoutPrefixProvider* dpp, bufferlist& data,
                      uint64_t offset, uint64_t& size) {
-  ldpp_dout(dpp, 20) << "DEBUG: read" << dendl;
-  int ret = ds3_obj_read(data.append_hole(size).c_str(), offset, &size,
+  ldpp_dout(dpp, 20) << "DEBUG: read offset=" << offset << " size=" << size
+                     << dendl;
+
+  // Workaround for libdaos 2.7.x bug: ds3_obj_read at non-zero offset
+  // ignores the offset and returns data from the start of the object.
+  // Always read from offset 0 and extract the requested subrange.
+  uint64_t full_size = offset + size;
+  bufferlist full_bl;
+  int ret = ds3_obj_read(full_bl.append_hole(full_size).c_str(), 0, &full_size,
                          get_daos_bucket()->ds3b, ds3o, nullptr);
   if (ret != 0) {
     ldpp_dout(dpp, 0) << "ERROR: failed to read from daos object ("
                       << get_bucket()->get_name() << ", " << get_key().get_oid()
                       << "): ret=" << ret << dendl;
+    size = 0;
+    return ret;
+  }
+  size = (full_size > offset) ? std::min(size, full_size - offset) : 0;
+  if (size > 0) {
+    bufferlist range;
+    range.substr_of(full_bl, offset, size);
+    data.claim_append(range);
   }
   return ret;
 }
@@ -1976,7 +1991,8 @@ int DaosMultipartUpload::complete(
     }
 
     // Reserve buffers and read
-    uint64_t size = part->get_size();
+    uint64_t expected_size = part->get_size();
+    uint64_t size = expected_size;
     bufferlist bl;
     ret = ds3_part_read(bl.append_hole(size).c_str(), 0, &size, ds3p,
                         store->ds3, nullptr);
@@ -1985,8 +2001,10 @@ int DaosMultipartUpload::complete(
       return ret;
     }
 
-    ldpp_dout(dpp, 20) << "DaosMultipartUpload::complete(): part " << part_num
-                       << " size is " << size << dendl;
+    ldpp_dout(dpp, 0) << "DEBUG [daos-multipart-fix-v1] complete() part="
+                      << part_num << " expected=" << expected_size
+                      << " actual_read=" << size
+                      << " bl.length()=" << bl.length() << dendl;
     combined_bl.claim_append(bl);
   }
 
