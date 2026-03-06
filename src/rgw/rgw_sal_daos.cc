@@ -1211,9 +1211,11 @@ int DaosObject::DaosReadOp::iterate(const DoutPrefixProvider* dpp, int64_t off,
   }
 
   // Call cb to process returned data.
+  // Note: bl_ofs must be 0 because DaosObject::read() places data at position
+  // 0 of bl (not at offset `off`).
   ldpp_dout(dpp, 20) << __func__ << ": call cb to process data, actual=" << size
                      << dendl;
-  cb->handle_data(bl, off, size);
+  cb->handle_data(bl, 0, size);
   return ret;
 }
 
@@ -1396,6 +1398,24 @@ int DaosObject::write(const DoutPrefixProvider* dpp, bufferlist&& data,
                       uint64_t offset) {
   ldpp_dout(dpp, 20) << "DEBUG: write" << dendl;
   uint64_t size = data.length();
+  {
+    const unsigned char* p = (const unsigned char*)data.c_str();
+    auto rd8 = [&](uint64_t off) -> uint64_t {
+      if (size < off + 8) return 0;
+      return ((uint64_t)p[off]<<56|(uint64_t)p[off+1]<<48|(uint64_t)p[off+2]<<40|
+              (uint64_t)p[off+3]<<32|(uint64_t)p[off+4]<<24|(uint64_t)p[off+5]<<16|
+              (uint64_t)p[off+6]<<8|(uint64_t)p[off+7]);
+    };
+    ldpp_dout(dpp, 0) << "DEBUG [obj-write] sz=" << size
+                      << " [0]=0x" << std::hex << std::setfill('0') << std::setw(16) << rd8(0)
+                      << " [1MB]=0x" << std::setw(16) << rd8(1048576)
+                      << " [5MB]=0x" << std::setw(16) << rd8(5242880)
+                      << " [8MB]=0x" << std::setw(16) << rd8(8388608)
+                      << " [16MB]=0x" << std::setw(16) << rd8(16777216)
+                      << " [20MB]=0x" << std::setw(16) << rd8(20971520)
+                      << " [24MB]=0x" << std::setw(16) << rd8(25165824)
+                      << std::dec << dendl;
+  }
   int ret = ds3_obj_write(data.c_str(), offset, &size, get_daos_bucket()->ds3b,
                           ds3o, nullptr);
   if (ret != 0) {
@@ -1419,20 +1439,23 @@ int DaosObject::read(const DoutPrefixProvider* dpp, bufferlist& data,
   bufferlist full_bl;
   int ret = ds3_obj_read(full_bl.append_hole(full_size).c_str(), 0, &full_size,
                          get_daos_bucket()->ds3b, ds3o, nullptr);
-  // Debug: log what ds3_obj_read returned and sample bytes
+  // Debug: log what ds3_obj_read returned and sample bytes at multiple positions
   {
     const unsigned char* p = (const unsigned char*)full_bl.c_str();
-    uint64_t a0 = (full_size >= 8) ?
-      ((uint64_t)p[0]<<56|(uint64_t)p[1]<<48|(uint64_t)p[2]<<40|(uint64_t)p[3]<<32|
-       (uint64_t)p[4]<<24|(uint64_t)p[5]<<16|(uint64_t)p[6]<<8|(uint64_t)p[7]) : 0;
-    uint64_t aoff = (full_size >= offset + 8) ?
-      ((uint64_t)p[offset]<<56|(uint64_t)p[offset+1]<<48|(uint64_t)p[offset+2]<<40|
-       (uint64_t)p[offset+3]<<32|(uint64_t)p[offset+4]<<24|(uint64_t)p[offset+5]<<16|
-       (uint64_t)p[offset+6]<<8|(uint64_t)p[offset+7]) : 0;
-    ldpp_dout(dpp, 0) << "DEBUG read: offset=" << offset
-                      << " req=" << req_size << " full_size_returned=" << full_size
-                      << " bl[0..7]=0x" << std::hex << std::setfill('0') << std::setw(16) << a0
-                      << " bl[off..off+7]=0x" << std::setw(16) << aoff
+    auto rd8 = [&](uint64_t off) -> uint64_t {
+      if (full_size < off + 8) return 0;
+      return ((uint64_t)p[off]<<56|(uint64_t)p[off+1]<<48|(uint64_t)p[off+2]<<40|
+              (uint64_t)p[off+3]<<32|(uint64_t)p[off+4]<<24|(uint64_t)p[off+5]<<16|
+              (uint64_t)p[off+6]<<8|(uint64_t)p[off+7]);
+    };
+    ldpp_dout(dpp, 0) << "DEBUG read: off=" << offset << " req=" << req_size
+                      << " got=" << full_size
+                      << " [0]=0x" << std::hex << std::setfill('0') << std::setw(16) << rd8(0)
+                      << " [1MB]=0x" << std::setw(16) << rd8(1048576)
+                      << " [5MB]=0x" << std::setw(16) << rd8(5242880)
+                      << " [8MB]=0x" << std::setw(16) << rd8(8388608)
+                      << " [16MB]=0x" << std::setw(16) << rd8(16777216)
+                      << " [off]=0x" << std::setw(16) << rd8(offset)
                       << std::dec << dendl;
   }
   if (ret != 0) {
