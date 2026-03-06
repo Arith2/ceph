@@ -987,10 +987,11 @@ int DaosObject::get_obj_attrs(optional_yield y, const DoutPrefixProvider* dpp,
                               rgw_obj* target_obj) {
   ldpp_dout(dpp, 20) << "DEBUG: DaosObject::get_obj_attrs()" << dendl;
   // Multipart meta objects don't exist as regular objects during upload_part.
-  // Returning -ENOENT is safe — callers like get_encrypt_filter() treat
-  // missing attrs as "no encryption configured", which is correct.
+  // Return 0 with empty attrs to signal "no encryption configured", which is
+  // correct. Returning -ENOENT would propagate as an error through callers
+  // like get_encrypt_filter() and cause the upload_part request to fail.
   if (get_key().ns == RGW_OBJ_NS_MULTIPART) {
-    return -ENOENT;
+    return 0;
   }
   Attrs& attrs = get_attrs();
   rgw_bucket_dir_entry ent;
