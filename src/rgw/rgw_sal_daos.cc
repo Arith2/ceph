@@ -2030,14 +2030,16 @@ int DaosMultipartUpload::get_info(const DoutPrefixProvider* dpp,
   }
 
   if (rule) {
-    if (!placement.empty()) {
-      *rule = &placement;
-      if (!attrs) {
-        // Don't need attrs, done
-        return 0;
-      }
-    } else {
-      *rule = nullptr;
+    if (placement.empty()) {
+      // Derive placement from bucket to avoid calling ds3_upload_get_info()
+      // which triggers a crash in libdaos 2.7.x (DAOS_COND_AKEY_FETCH bug).
+      // DAOS always uses default/STANDARD placement so this is always correct.
+      placement = bucket->get_info().placement_rule;
+    }
+    *rule = &placement;
+    if (!attrs) {
+      // Don't need attrs, done
+      return 0;
     }
   }
 
@@ -2111,6 +2113,10 @@ int DaosMultipartWriter::prepare(optional_yield y) {
                      << part_num_str << dendl;
   int ret = ds3_part_open(get_bucket_name().c_str(), upload_id.c_str(),
                           part_num, true, &ds3p, store->ds3);
+  ldpp_dout(dpp, 0) << "DEBUG [daos-multipart-fix-v1] ds3_part_open ret=" << ret
+                    << " bucket=" << get_bucket_name()
+                    << " upload_id=" << upload_id
+                    << " part=" << part_num << dendl;
   if (ret == -ENOENT) {
     ret = -ERR_NO_SUCH_UPLOAD;
   }
