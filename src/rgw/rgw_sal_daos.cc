@@ -1616,33 +1616,62 @@ DaosAtomicWriter::DaosAtomicWriter(
       unique_tag(_unique_tag),
       obj(_store, obj->get_key(), obj->get_bucket()) {}
 
+DaosAtomicWriter::~DaosAtomicWriter() {
+  if (writer_ds3b) {
+    ds3_bucket_close(writer_ds3b, nullptr);
+    writer_ds3b = nullptr;
+  }
+}
+
 int DaosAtomicWriter::prepare(optional_yield y) {
   ldpp_dout(dpp, 20) << "DEBUG: prepare" << dendl;
-  int ret = obj.create(dpp);
+
+  // Open a private ds3b handle for this writer so that concurrent PUTs to the
+  // same bucket don't serialize on the shared DaosBucket::ds3b handle.
+  int ret = ds3_bucket_open(obj.get_bucket()->get_name().c_str(),
+                            &writer_ds3b, store->ds3, nullptr);
+  if (ret != 0) {
+    ldpp_dout(dpp, 0) << "ERROR: prepare: ds3_bucket_open failed ret=" << ret
+                      << dendl;
+    return ret;
+  }
+
+  // Create the object through the private handle.
+  ret = ds3_obj_create(obj.get_key().get_oid().c_str(), &obj.ds3o, writer_ds3b);
+  if (ret != 0) {
+    ldpp_dout(dpp, 0) << "ERROR: failed to create daos object ("
+                      << obj.get_bucket()->get_name() << ", "
+                      << obj.get_key().get_oid() << "): ret=" << ret << dendl;
+    ds3_bucket_close(writer_ds3b, nullptr);
+    writer_ds3b = nullptr;
+  }
   return ret;
 }
 
-// TODO: Handle concurrent writes, a unique object id is a possible solution, or
-// use DAOS transactions
-// XXX: Do we need to accumulate writes as motr does?
 int DaosAtomicWriter::process(bufferlist&& data, uint64_t offset) {
   ldpp_dout(dpp, 20) << "DEBUG: process" << dendl;
   if (data.length() == 0) {
     return 0;
   }
 
-  int ret = 0;
-  if (!obj.is_open()) {
-    ret = obj.lookup(dpp);
-    if (ret != 0) {
-      return ret;
-    }
+  if (writer_ds3b == nullptr || !obj.is_open()) {
+    ldpp_dout(dpp, 0) << "ERROR: process called but writer not prepared "
+                      << "(writer_ds3b=" << writer_ds3b
+                      << " ds3o=" << obj.ds3o << ")" << dendl;
+    return -EIO;
   }
 
-  // XXX: Combine multiple streams into one as motr does
+  // Write directly using the private writer_ds3b handle instead of the shared
+  // DaosBucket::ds3b so concurrent PUTs can proceed without serializing.
   uint64_t data_size = data.length();
-  ret = obj.write(dpp, std::move(data), offset);
-  if (ret == 0) {
+  uint64_t size = data_size;
+  int ret = ds3_obj_write(data.c_str(), offset, &size, writer_ds3b,
+                          obj.ds3o, nullptr);
+  if (ret != 0) {
+    ldpp_dout(dpp, 0) << "ERROR: failed to write into daos object ("
+                      << obj.get_bucket()->get_name() << ", "
+                      << obj.get_key().get_oid() << "): ret=" << ret << dendl;
+  } else {
     total_data_size += data_size;
   }
   return ret;
@@ -1706,6 +1735,11 @@ int DaosAtomicWriter::complete(
     }
   }
 
+  // Release the private bucket handle now that all DAOS operations are done.
+  if (writer_ds3b) {
+    ds3_bucket_close(writer_ds3b, nullptr);
+    writer_ds3b = nullptr;
+  }
   return ret;
 }
 

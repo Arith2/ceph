@@ -751,6 +751,9 @@ class DaosAtomicWriter : public StoreWriter {
   const std::string& unique_tag;
   DaosObject obj;
   uint64_t total_data_size = 0;  // for total data being uploaded
+  // Private per-writer bucket handle: avoids serialization on the shared
+  // DaosBucket::ds3b when multiple concurrent PUTs target the same bucket.
+  ds3_bucket_t* writer_ds3b = nullptr;
 
  public:
   DaosAtomicWriter(const DoutPrefixProvider* dpp, optional_yield y,
@@ -758,7 +761,7 @@ class DaosAtomicWriter : public StoreWriter {
                    DaosStore* _store, const rgw_user& _owner,
                    const rgw_placement_rule* _ptail_placement_rule,
                    uint64_t _olh_epoch, const std::string& _unique_tag);
-  ~DaosAtomicWriter() = default;
+  ~DaosAtomicWriter();
 
   // prepare to start processing object data
   virtual int prepare(optional_yield y) override;
