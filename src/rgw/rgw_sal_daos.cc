@@ -1617,6 +1617,12 @@ DaosAtomicWriter::DaosAtomicWriter(
       obj(_store, obj->get_key(), obj->get_bucket()) {}
 
 DaosAtomicWriter::~DaosAtomicWriter() {
+  if (write_submitted) {
+    bool flag = false;
+    daos_event_test(&write_ev, DAOS_EQ_WAIT, &flag);
+    daos_event_fini(&write_ev);
+    write_submitted = false;
+  }
   if (writer_ds3b) {
     ds3_bucket_close(writer_ds3b, nullptr);
     writer_ds3b = nullptr;
@@ -1626,10 +1632,17 @@ DaosAtomicWriter::~DaosAtomicWriter() {
 int DaosAtomicWriter::prepare(optional_yield y) {
   ldpp_dout(dpp, 20) << "DEBUG: prepare" << dendl;
 
+  using sc = std::chrono::steady_clock;
+  using ms = std::chrono::milliseconds;
+  auto t0 = sc::now();
+  t_prepare_start = t0;
+  first_process_seen = false;
+
   // Open a private ds3b handle for this writer so that concurrent PUTs to the
   // same bucket don't serialize on the shared DaosBucket::ds3b handle.
   int ret = ds3_bucket_open(obj.get_bucket()->get_name().c_str(),
                             &writer_ds3b, store->ds3, nullptr);
+  auto t1 = sc::now();
   if (ret != 0) {
     ldpp_dout(dpp, 0) << "ERROR: prepare: ds3_bucket_open failed ret=" << ret
                       << dendl;
@@ -1638,6 +1651,7 @@ int DaosAtomicWriter::prepare(optional_yield y) {
 
   // Create the object through the private handle.
   ret = ds3_obj_create(obj.get_key().get_oid().c_str(), &obj.ds3o, writer_ds3b);
+  auto t2 = sc::now();
   if (ret != 0) {
     ldpp_dout(dpp, 0) << "ERROR: failed to create daos object ("
                       << obj.get_bucket()->get_name() << ", "
@@ -1645,6 +1659,11 @@ int DaosAtomicWriter::prepare(optional_yield y) {
     ds3_bucket_close(writer_ds3b, nullptr);
     writer_ds3b = nullptr;
   }
+
+  ldpp_dout(dpp, 0) << "TIMING prepare(): "
+    << "bucket_open=" << std::chrono::duration_cast<ms>(t1 - t0).count() << "ms "
+    << "obj_create=" << std::chrono::duration_cast<ms>(t2 - t1).count() << "ms"
+    << dendl;
   return ret;
 }
 
@@ -1654,6 +1673,15 @@ int DaosAtomicWriter::process(bufferlist&& data, uint64_t offset) {
     return 0;
   }
 
+  {
+    auto now = std::chrono::steady_clock::now();
+    if (!first_process_seen) {
+      t_first_process = now;
+      first_process_seen = true;
+    }
+    t_last_process = now;
+  }
+
   if (writer_ds3b == nullptr || !obj.is_open()) {
     ldpp_dout(dpp, 0) << "ERROR: process called but writer not prepared "
                       << "(writer_ds3b=" << writer_ds3b
@@ -1661,20 +1689,44 @@ int DaosAtomicWriter::process(bufferlist&& data, uint64_t offset) {
     return -EIO;
   }
 
-  // Write directly using the private writer_ds3b handle instead of the shared
-  // DaosBucket::ds3b so concurrent PUTs can proceed without serializing.
+  // If a previous async write is still in-flight (multi-chunk object), wait
+  // for it to complete before submitting the next chunk.
+  if (write_submitted) {
+    bool flag = false;
+    daos_event_test(&write_ev, DAOS_EQ_WAIT, &flag);
+    int ev_ret = write_ev.ev_error;
+    daos_event_fini(&write_ev);
+    write_submitted = false;
+    pending_data.clear();
+    if (ev_ret != 0) {
+      ldpp_dout(dpp, 0) << "ERROR: async write completed with error: "
+                        << ev_ret << dendl;
+      return -ev_ret;
+    }
+  }
+
+  // Keep data alive until the async DAOS write completes (the DS3 library
+  // holds a raw pointer into this buffer until the event fires).
   uint64_t data_size = data.length();
+  pending_data.claim_append(data);
+
+  // Submit the write asynchronously and return immediately.  Concurrent PUT
+  // requests in other threads can now also submit their writes, giving DAOS
+  // the same iodepth effect that fio achieves with --iodepth=N.
+  daos_event_init(&write_ev, DAOS_HDL_INVAL, nullptr);
   uint64_t size = data_size;
-  int ret = ds3_obj_write(data.c_str(), offset, &size, writer_ds3b,
-                          obj.ds3o, nullptr);
+  int ret = ds3_obj_write(pending_data.c_str(), offset, &size,
+                          writer_ds3b, obj.ds3o, &write_ev);
   if (ret != 0) {
-    ldpp_dout(dpp, 0) << "ERROR: failed to write into daos object ("
+    ldpp_dout(dpp, 0) << "ERROR: failed to submit async write ("
                       << obj.get_bucket()->get_name() << ", "
                       << obj.get_key().get_oid() << "): ret=" << ret << dendl;
-  } else {
-    total_data_size += data_size;
+    daos_event_fini(&write_ev);
+    return ret;
   }
-  return ret;
+  write_submitted = true;
+  total_data_size += data_size;
+  return 0;
 }
 
 int DaosAtomicWriter::complete(
@@ -1687,6 +1739,27 @@ int DaosAtomicWriter::complete(
   bufferlist bl;
   rgw_bucket_dir_entry ent;
   int ret;
+
+  using sc = std::chrono::steady_clock;
+  using ms = std::chrono::milliseconds;
+  auto t_complete_start = sc::now();
+
+  // Wait for the async data write submitted in process() to complete before
+  // writing metadata.  All concurrent writers reach this point independently,
+  // so their DAOS writes have been in-flight simultaneously.
+  if (write_submitted) {
+    bool flag = false;
+    daos_event_test(&write_ev, DAOS_EQ_WAIT, &flag);
+    ret = write_ev.ev_error;
+    daos_event_fini(&write_ev);
+    write_submitted = false;
+    pending_data.clear();
+    if (ret != 0) {
+      ldpp_dout(dpp, 0) << "ERROR: async data write failed: " << ret << dendl;
+      return -ret;
+    }
+  }
+  auto t_after_data = sc::now();
 
   // Set rgw_bucet_dir_entry. Some of the members of this structure may not
   // apply to daos.
@@ -1727,6 +1800,7 @@ int DaosAtomicWriter::complete(
   }
 
   ret = obj.set_dir_entry_attrs(dpp, &ent, &attrs);
+  auto t_after_meta = sc::now();
 
   if (is_versioned) {
     ret = obj.mark_as_latest(dpp, set_mtime);
@@ -1740,6 +1814,18 @@ int DaosAtomicWriter::complete(
     ds3_bucket_close(writer_ds3b, nullptr);
     writer_ds3b = nullptr;
   }
+  auto t_end = sc::now();
+
+  ldpp_dout(dpp, 0) << "TIMING pipeline(): "
+    << "prepare_to_first_process=" << (first_process_seen ? std::to_string(std::chrono::duration_cast<ms>(t_first_process - t_prepare_start).count()) : "N/A") << "ms "
+    << "body_reception=" << (first_process_seen ? std::to_string(std::chrono::duration_cast<ms>(t_last_process - t_first_process).count()) : "N/A") << "ms "
+    << "process_to_complete=" << (first_process_seen ? std::to_string(std::chrono::duration_cast<ms>(t_complete_start - t_last_process).count()) : "N/A") << "ms "
+    << "daos_data_wait=" << std::chrono::duration_cast<ms>(t_after_data - t_complete_start).count() << "ms "
+    << "metadata=" << std::chrono::duration_cast<ms>(t_after_meta - t_after_data).count() << "ms "
+    << "bucket_close=" << std::chrono::duration_cast<ms>(t_end - t_after_meta).count() << "ms "
+    << "total=" << (first_process_seen ? std::to_string(std::chrono::duration_cast<ms>(t_end - t_prepare_start).count()) : std::to_string(std::chrono::duration_cast<ms>(t_end - t_complete_start).count())) << "ms"
+    << dendl;
+
   return ret;
 }
 

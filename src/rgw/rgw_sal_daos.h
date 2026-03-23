@@ -754,6 +754,15 @@ class DaosAtomicWriter : public StoreWriter {
   // Private per-writer bucket handle: avoids serialization on the shared
   // DaosBucket::ds3b when multiple concurrent PUTs target the same bucket.
   ds3_bucket_t* writer_ds3b = nullptr;
+  // Async write state: buffer kept alive until DAOS write event completes.
+  ceph::bufferlist pending_data;
+  daos_event_t write_ev = {};
+  bool write_submitted = false;
+  // Per-request pipeline timestamps for latency breakdown.
+  std::chrono::steady_clock::time_point t_prepare_start;
+  std::chrono::steady_clock::time_point t_first_process;
+  std::chrono::steady_clock::time_point t_last_process;
+  bool first_process_seen = false;
 
  public:
   DaosAtomicWriter(const DoutPrefixProvider* dpp, optional_yield y,
