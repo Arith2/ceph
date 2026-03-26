@@ -1,0 +1,233 @@
+// SPDX-License-Identifier: LGPL-2.1
+#include "rgw_rdma.h"
+
+#include <arpa/inet.h>
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
+#include <sys/mman.h>
+#include <thread>
+#include <unistd.h>
+
+RGWRdmaServer&
+RGWRdmaServer::instance() {
+    static RGWRdmaServer inst;
+    return inst;
+}
+
+RGWRdmaServer::~RGWRdmaServer() { stop(); }
+
+bool
+RGWRdmaServer::start(int port) {
+    bool was_running = running_.exchange(true);
+    FILE* sf = fopen("/tmp/rgw_rdma_start.log", "w");
+    if (sf) {
+        fprintf(sf, "start() called, was_running=%d, pid=%d\n", (int)was_running, (int)getpid());
+        fclose(sf);
+    }
+    if (was_running) return true;
+    listen_thread_ = std::thread(&RGWRdmaServer::listen_loop, this, port);
+    return true;
+}
+
+void
+RGWRdmaServer::stop() {
+    running_ = false;
+    if (pre_mr_)  { ibv_dereg_mr(pre_mr_);           pre_mr_  = nullptr; }
+    if (pre_buf_) { munmap(pre_buf_, kPreBufSize);    pre_buf_ = nullptr; }
+    if (cq_)  { ibv_destroy_cq(cq_);               cq_  = nullptr; }
+    if (cid_) { rdma_destroy_id(cid_);              cid_ = nullptr; }
+    if (lid_) { rdma_destroy_id(lid_);              lid_ = nullptr; }
+    if (ec_)  { rdma_destroy_event_channel(ec_);    ec_  = nullptr; }
+    if (listen_thread_.joinable()) listen_thread_.join();
+}
+
+void
+RGWRdmaServer::listen_loop(int port) {
+    FILE* dbg = fopen("/tmp/rgw_rdma_debug.log", "w");
+    if (dbg) { fprintf(dbg, "listen_loop started port=%d\n", port); fflush(dbg); }
+
+    ec_ = rdma_create_event_channel();
+    if (!ec_) {
+        if (dbg) { fprintf(dbg, "rdma_create_event_channel failed: %s\n", strerror(errno)); fclose(dbg); }
+        return;
+    }
+    if (dbg) { fprintf(dbg, "event_channel OK\n"); fflush(dbg); }
+
+    if (rdma_create_id(ec_, &lid_, nullptr, RDMA_PS_TCP) != 0) {
+        if (dbg) { fprintf(dbg, "rdma_create_id failed: %s\n", strerror(errno)); fclose(dbg); }
+        return;
+    }
+    if (dbg) { fprintf(dbg, "create_id OK\n"); fflush(dbg); }
+
+    struct sockaddr_in addr{};
+    addr.sin_family      = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port        = htons(static_cast<uint16_t>(port));
+    if (rdma_bind_addr(lid_, reinterpret_cast<struct sockaddr*>(&addr)) != 0) {
+        if (dbg) { fprintf(dbg, "rdma_bind_addr failed: %s\n", strerror(errno)); fclose(dbg); }
+        return;
+    }
+    if (dbg) { fprintf(dbg, "bind_addr OK\n"); fflush(dbg); }
+
+    if (rdma_listen(lid_, 1) != 0) {
+        if (dbg) { fprintf(dbg, "rdma_listen failed: %s\n", strerror(errno)); fclose(dbg); }
+        return;
+    }
+    if (dbg) { fprintf(dbg, "listening OK on port %d\n", port); fflush(dbg); }
+
+    struct rdma_cm_event* ev = nullptr;
+    if (rdma_get_cm_event(ec_, &ev) != 0 ||
+        ev->event != RDMA_CM_EVENT_CONNECT_REQUEST) {
+        if (dbg) fprintf(dbg, "expected CONNECT_REQUEST, got %d\n", ev ? (int)ev->event : -1);
+        if (ev) rdma_ack_cm_event(ev);
+        if (dbg) fclose(dbg);
+        return;
+    }
+    if (dbg) { fprintf(dbg, "got CONNECT_REQUEST\n"); fflush(dbg); }
+    cid_ = ev->id;
+    rdma_ack_cm_event(ev);
+
+    pd_ = ibv_alloc_pd(cid_->verbs);
+    if (!pd_) {
+        if (dbg) { fprintf(dbg, "ibv_alloc_pd failed: %s\n", strerror(errno)); fclose(dbg); }
+        return;
+    }
+    if (dbg) { fprintf(dbg, "alloc_pd OK\n"); fflush(dbg); }
+
+    cq_ = ibv_create_cq(cid_->verbs, 64, nullptr, nullptr, 0);
+    if (!cq_) {
+        if (dbg) { fprintf(dbg, "ibv_create_cq failed\n"); fclose(dbg); }
+        return;
+    }
+    if (dbg) { fprintf(dbg, "create_cq OK\n"); fflush(dbg); }
+
+    struct ibv_qp_init_attr qp_attr{};
+    qp_attr.send_cq          = cq_;
+    qp_attr.recv_cq          = cq_;
+    qp_attr.qp_type          = IBV_QPT_RC;
+    qp_attr.cap.max_send_wr  = 64;
+    qp_attr.cap.max_recv_wr  = 1;
+    qp_attr.cap.max_send_sge = 1;
+    qp_attr.cap.max_recv_sge = 1;
+    if (rdma_create_qp(cid_, pd_, &qp_attr) != 0) {
+        if (dbg) { fprintf(dbg, "rdma_create_qp failed: %s\n", strerror(errno)); fclose(dbg); }
+        return;
+    }
+    if (dbg) { fprintf(dbg, "create_qp OK\n"); fflush(dbg); }
+
+    struct rdma_conn_param conn_param{};
+    conn_param.responder_resources = 16;
+    conn_param.initiator_depth     = 16;
+    if (rdma_accept(cid_, &conn_param) != 0) {
+        if (dbg) { fprintf(dbg, "rdma_accept failed: %s\n", strerror(errno)); fclose(dbg); }
+        return;
+    }
+    if (dbg) { fprintf(dbg, "rdma_accept OK\n"); fflush(dbg); }
+
+    if (rdma_get_cm_event(ec_, &ev) != 0 ||
+        ev->event != RDMA_CM_EVENT_ESTABLISHED) {
+        if (dbg) fprintf(dbg, "expected ESTABLISHED, got %d\n", ev ? (int)ev->event : -1);
+        if (ev) rdma_ack_cm_event(ev);
+        if (dbg) fclose(dbg);
+        return;
+    }
+    rdma_ack_cm_event(ev);
+
+    if (dbg) { fprintf(dbg, "NIXL client connected!\n"); fflush(dbg); }
+
+    // Pre-allocate and pre-touch a staging buffer, then register it once with
+    // the HCA. Subsequent rdma_read() calls reuse this MR, avoiding the
+    // ibv_reg_mr/ibv_dereg_mr overhead on every PUT request.
+    // MAP_POPULATE faults in all pages immediately so ibv_reg_mr is fast.
+    pre_buf_ = mmap(nullptr, kPreBufSize, PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
+    if (pre_buf_ == MAP_FAILED) {
+        pre_buf_ = nullptr;
+        if (dbg) fprintf(dbg, "mmap pre_buf failed: %s\n", strerror(errno));
+    } else {
+        pre_mr_ = ibv_reg_mr(pd_, pre_buf_, kPreBufSize, IBV_ACCESS_LOCAL_WRITE);
+        if (!pre_mr_) {
+            if (dbg) fprintf(dbg, "ibv_reg_mr pre_buf failed: %s\n", strerror(errno));
+            munmap(pre_buf_, kPreBufSize);
+            pre_buf_ = nullptr;
+        } else {
+            if (dbg) fprintf(dbg, "pre_buf registered: size=%zu\n", kPreBufSize);
+        }
+    }
+
+    ready_ = true;
+    if (dbg) fclose(dbg);
+}
+
+int
+RGWRdmaServer::rdma_read(const NixlRdmaToken& tok, void* local_buf, size_t len) {
+    if (!ready_) return -ENOTCONN;
+
+    // Use the pre-registered staging buffer if the request fits, avoiding
+    // ibv_reg_mr/ibv_dereg_mr on the critical path. Fall back to per-call
+    // registration for oversized requests.
+    bool use_pre = (pre_buf_ && pre_mr_ && len <= kPreBufSize);
+
+    struct ibv_mr* tmp_mr = nullptr;
+    if (!use_pre) {
+        tmp_mr = ibv_reg_mr(pd_, local_buf, len, IBV_ACCESS_LOCAL_WRITE);
+        if (!tmp_mr) return -errno;
+    }
+
+    void*    dst  = use_pre ? pre_buf_ : local_buf;
+    uint32_t lkey = use_pre ? pre_mr_->lkey : tmp_mr->lkey;
+
+    std::lock_guard<std::mutex> lock(rdma_mutex_);
+
+    struct ibv_sge sge{};
+    sge.addr   = reinterpret_cast<uint64_t>(dst);
+    sge.length = static_cast<uint32_t>(len);
+    sge.lkey   = lkey;
+
+    struct ibv_send_wr wr{}, *bad_wr = nullptr;
+    wr.wr_id               = reinterpret_cast<uint64_t>(dst);
+    wr.opcode              = IBV_WR_RDMA_READ;
+    wr.send_flags          = IBV_SEND_SIGNALED;
+    wr.sg_list             = &sge;
+    wr.num_sge             = 1;
+    wr.wr.rdma.remote_addr = tok.addr;
+    wr.wr.rdma.rkey        = tok.rkey;
+
+    int ret = ibv_post_send(cid_->qp, &wr, &bad_wr);
+    if (ret != 0) {
+        if (tmp_mr) ibv_dereg_mr(tmp_mr);
+        return -ret;
+    }
+
+    struct ibv_wc wc{};
+    int nc;
+    do { nc = ibv_poll_cq(cq_, 1, &wc); } while (nc == 0);
+
+    if (tmp_mr) ibv_dereg_mr(tmp_mr);
+
+    if (nc < 0 || wc.status != IBV_WC_SUCCESS) {
+        fprintf(stderr, "RGWRdmaServer: RDMA_READ failed, wc.status=%s\n",
+                ibv_wc_status_str(wc.status));
+        return -EIO;
+    }
+
+    if (use_pre)
+        memcpy(local_buf, pre_buf_, len);
+
+    return 0;
+}
+
+bool
+RGWRdmaServer::parse_token(const char* hex, NixlRdmaToken& out) {
+    constexpr size_t expected = sizeof(NixlRdmaToken) * 2;
+    if (!hex || strlen(hex) != expected) return false;
+    auto* dst = reinterpret_cast<uint8_t*>(&out);
+    for (size_t i = 0; i < sizeof(NixlRdmaToken); ++i) {
+        char byte_str[3] = {hex[i * 2], hex[i * 2 + 1], '\0'};
+        char* end        = nullptr;
+        dst[i] = static_cast<uint8_t>(strtoul(byte_str, &end, 16));
+        if (end == nullptr || *end != '\0') return false;
+    }
+    return true;
+}
