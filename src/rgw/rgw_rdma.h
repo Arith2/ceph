@@ -36,6 +36,12 @@ public:
     // Returns 0 on success, -errno on failure.
     int rdma_read(const NixlRdmaToken& tok, void* local_buf, size_t len);
 
+    // Perform RDMA_WRITE: push len bytes from src to NIXL memory at
+    // tok.addr + remote_offset.  Used by the GET path to deliver object data.
+    // Returns 0 on success, -errno on failure.
+    int rdma_write(const NixlRdmaToken& tok, const void* src, size_t len,
+                   size_t remote_offset = 0);
+
     // Parse 48-char hex string produced by RdmaContext::buildToken().
     // Returns false on malformed input.
     static bool parse_token(const char* hex, NixlRdmaToken& out);

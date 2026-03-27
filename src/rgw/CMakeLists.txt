@@ -220,6 +220,9 @@ endif()
 if(WITH_RADOSGW_DAOS)
   list(APPEND librgw_common_srcs rgw_sal_daos.cc)
 endif()
+
+list(APPEND librgw_common_srcs rgw_rdma.cc)
+
 if(WITH_JAEGER)
   list(APPEND librgw_common_srcs rgw_tracer.cc)
 endif()
@@ -243,6 +246,8 @@ endif()
 target_link_libraries(rgw_common
   PRIVATE
     global
+    ibverbs
+    rdmacm
     cls_2pc_queue_client
     cls_cmpomap_client
     cls_lock_client

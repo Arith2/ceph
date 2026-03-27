@@ -17,6 +17,7 @@
 
 #ifdef HAVE_SYS_PRCTL_H
 #include <sys/prctl.h>
+#include "rgw_rdma.h"
 #endif
 
 using namespace std;
@@ -109,6 +110,8 @@ int main(int argc, char *argv[])
   if (g_conf()->daemonize) {
     global_init_daemonize(g_ceph_context);
   }
+  // Start RDMA server after daemonization so it runs in the daemon process
+  RGWRdmaServer::instance().start(7471);
   ceph::mutex mutex = ceph::make_mutex("main");
   SafeTimer init_timer(g_ceph_context, mutex);
   init_timer.init();

@@ -52,13 +52,11 @@ RGWRdmaServer::listen_loop(int port) {
         if (dbg) { fprintf(dbg, "rdma_create_event_channel failed: %s\n", strerror(errno)); fclose(dbg); }
         return;
     }
-    if (dbg) { fprintf(dbg, "event_channel OK\n"); fflush(dbg); }
 
     if (rdma_create_id(ec_, &lid_, nullptr, RDMA_PS_TCP) != 0) {
         if (dbg) { fprintf(dbg, "rdma_create_id failed: %s\n", strerror(errno)); fclose(dbg); }
         return;
     }
-    if (dbg) { fprintf(dbg, "create_id OK\n"); fflush(dbg); }
 
     struct sockaddr_in addr{};
     addr.sin_family      = AF_INET;
@@ -68,95 +66,139 @@ RGWRdmaServer::listen_loop(int port) {
         if (dbg) { fprintf(dbg, "rdma_bind_addr failed: %s\n", strerror(errno)); fclose(dbg); }
         return;
     }
-    if (dbg) { fprintf(dbg, "bind_addr OK\n"); fflush(dbg); }
 
-    if (rdma_listen(lid_, 1) != 0) {
+    if (rdma_listen(lid_, 8) != 0) {
         if (dbg) { fprintf(dbg, "rdma_listen failed: %s\n", strerror(errno)); fclose(dbg); }
         return;
     }
     if (dbg) { fprintf(dbg, "listening OK on port %d\n", port); fflush(dbg); }
 
-    struct rdma_cm_event* ev = nullptr;
-    if (rdma_get_cm_event(ec_, &ev) != 0 ||
-        ev->event != RDMA_CM_EVENT_CONNECT_REQUEST) {
-        if (dbg) fprintf(dbg, "expected CONNECT_REQUEST, got %d\n", ev ? (int)ev->event : -1);
-        if (ev) rdma_ack_cm_event(ev);
-        if (dbg) fclose(dbg);
-        return;
-    }
-    if (dbg) { fprintf(dbg, "got CONNECT_REQUEST\n"); fflush(dbg); }
-    cid_ = ev->id;
-    rdma_ack_cm_event(ev);
-
-    pd_ = ibv_alloc_pd(cid_->verbs);
-    if (!pd_) {
-        if (dbg) { fprintf(dbg, "ibv_alloc_pd failed: %s\n", strerror(errno)); fclose(dbg); }
-        return;
-    }
-    if (dbg) { fprintf(dbg, "alloc_pd OK\n"); fflush(dbg); }
-
-    cq_ = ibv_create_cq(cid_->verbs, 64, nullptr, nullptr, 0);
-    if (!cq_) {
-        if (dbg) { fprintf(dbg, "ibv_create_cq failed\n"); fclose(dbg); }
-        return;
-    }
-    if (dbg) { fprintf(dbg, "create_cq OK\n"); fflush(dbg); }
-
-    struct ibv_qp_init_attr qp_attr{};
-    qp_attr.send_cq          = cq_;
-    qp_attr.recv_cq          = cq_;
-    qp_attr.qp_type          = IBV_QPT_RC;
-    qp_attr.cap.max_send_wr  = 64;
-    qp_attr.cap.max_recv_wr  = 1;
-    qp_attr.cap.max_send_sge = 1;
-    qp_attr.cap.max_recv_sge = 1;
-    if (rdma_create_qp(cid_, pd_, &qp_attr) != 0) {
-        if (dbg) { fprintf(dbg, "rdma_create_qp failed: %s\n", strerror(errno)); fclose(dbg); }
-        return;
-    }
-    if (dbg) { fprintf(dbg, "create_qp OK\n"); fflush(dbg); }
-
-    struct rdma_conn_param conn_param{};
-    conn_param.responder_resources = 16;
-    conn_param.initiator_depth     = 16;
-    if (rdma_accept(cid_, &conn_param) != 0) {
-        if (dbg) { fprintf(dbg, "rdma_accept failed: %s\n", strerror(errno)); fclose(dbg); }
-        return;
-    }
-    if (dbg) { fprintf(dbg, "rdma_accept OK\n"); fflush(dbg); }
-
-    if (rdma_get_cm_event(ec_, &ev) != 0 ||
-        ev->event != RDMA_CM_EVENT_ESTABLISHED) {
-        if (dbg) fprintf(dbg, "expected ESTABLISHED, got %d\n", ev ? (int)ev->event : -1);
-        if (ev) rdma_ack_cm_event(ev);
-        if (dbg) fclose(dbg);
-        return;
-    }
-    rdma_ack_cm_event(ev);
-
-    if (dbg) { fprintf(dbg, "NIXL client connected!\n"); fflush(dbg); }
-
-    // Pre-allocate and pre-touch a staging buffer, then register it once with
-    // the HCA. Subsequent rdma_read() calls reuse this MR, avoiding the
-    // ibv_reg_mr/ibv_dereg_mr overhead on every PUT request.
-    // MAP_POPULATE faults in all pages immediately so ibv_reg_mr is fast.
-    pre_buf_ = mmap(nullptr, kPreBufSize, PROT_READ | PROT_WRITE,
-                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
-    if (pre_buf_ == MAP_FAILED) {
-        pre_buf_ = nullptr;
-        if (dbg) fprintf(dbg, "mmap pre_buf failed: %s\n", strerror(errno));
-    } else {
-        pre_mr_ = ibv_reg_mr(pd_, pre_buf_, kPreBufSize, IBV_ACCESS_LOCAL_WRITE);
-        if (!pre_mr_) {
-            if (dbg) fprintf(dbg, "ibv_reg_mr pre_buf failed: %s\n", strerror(errno));
-            munmap(pre_buf_, kPreBufSize);
-            pre_buf_ = nullptr;
-        } else {
-            if (dbg) fprintf(dbg, "pre_buf registered: size=%zu\n", kPreBufSize);
+    // Accept loop: handle reconnections from successive nixlbench runs.
+    while (running_) {
+        struct rdma_cm_event* ev = nullptr;
+        if (rdma_get_cm_event(ec_, &ev) != 0) {
+            if (dbg) fprintf(dbg, "rdma_get_cm_event error: %s\n", strerror(errno));
+            break;
         }
+
+        if (ev->event == RDMA_CM_EVENT_DISCONNECTED) {
+            if (dbg) { fprintf(dbg, "client disconnected\n"); fflush(dbg); }
+            rdma_ack_cm_event(ev);
+            ready_ = false;
+            continue;
+        }
+
+        if (ev->event != RDMA_CM_EVENT_CONNECT_REQUEST) {
+            if (dbg) fprintf(dbg, "unexpected event %d — ignoring\n", (int)ev->event);
+            rdma_ack_cm_event(ev);
+            continue;
+        }
+
+        if (dbg) { fprintf(dbg, "got CONNECT_REQUEST\n"); fflush(dbg); }
+
+        // New client connecting — set up fresh connection resources.
+        struct rdma_cm_id* new_cid = ev->id;
+        rdma_ack_cm_event(ev);
+
+        struct ibv_pd*  new_pd = ibv_alloc_pd(new_cid->verbs);
+        if (!new_pd) {
+            if (dbg) fprintf(dbg, "ibv_alloc_pd failed: %s\n", strerror(errno));
+            rdma_destroy_id(new_cid);
+            continue;
+        }
+
+        struct ibv_cq* new_cq = ibv_create_cq(new_cid->verbs, 64, nullptr, nullptr, 0);
+        if (!new_cq) {
+            if (dbg) fprintf(dbg, "ibv_create_cq failed\n");
+            ibv_dealloc_pd(new_pd);
+            rdma_destroy_id(new_cid);
+            continue;
+        }
+
+        struct ibv_qp_init_attr qp_attr{};
+        qp_attr.send_cq          = new_cq;
+        qp_attr.recv_cq          = new_cq;
+        qp_attr.qp_type          = IBV_QPT_RC;
+        qp_attr.cap.max_send_wr  = 64;
+        qp_attr.cap.max_recv_wr  = 1;
+        qp_attr.cap.max_send_sge = 1;
+        qp_attr.cap.max_recv_sge = 1;
+        if (rdma_create_qp(new_cid, new_pd, &qp_attr) != 0) {
+            if (dbg) fprintf(dbg, "rdma_create_qp failed: %s\n", strerror(errno));
+            ibv_destroy_cq(new_cq);
+            ibv_dealloc_pd(new_pd);
+            rdma_destroy_id(new_cid);
+            continue;
+        }
+
+        struct rdma_conn_param conn_param{};
+        conn_param.responder_resources = 16;
+        conn_param.initiator_depth     = 16;
+        if (rdma_accept(new_cid, &conn_param) != 0) {
+            if (dbg) fprintf(dbg, "rdma_accept failed: %s\n", strerror(errno));
+            rdma_destroy_qp(new_cid);
+            ibv_destroy_cq(new_cq);
+            ibv_dealloc_pd(new_pd);
+            rdma_destroy_id(new_cid);
+            continue;
+        }
+
+        // Wait for ESTABLISHED on the new connection.
+        if (rdma_get_cm_event(ec_, &ev) != 0 ||
+            ev->event != RDMA_CM_EVENT_ESTABLISHED) {
+            if (dbg) fprintf(dbg, "expected ESTABLISHED, got %d\n",
+                             ev ? (int)ev->event : -1);
+            if (ev) rdma_ack_cm_event(ev);
+            rdma_destroy_qp(new_cid);
+            ibv_destroy_cq(new_cq);
+            ibv_dealloc_pd(new_pd);
+            rdma_destroy_id(new_cid);
+            continue;
+        }
+        rdma_ack_cm_event(ev);
+        if (dbg) { fprintf(dbg, "NIXL client connected!\n"); fflush(dbg); }
+
+        // Allocate and pre-register staging buffer for this connection.
+        // MAP_POPULATE faults in all pages immediately so ibv_reg_mr is fast.
+        void* new_buf = mmap(nullptr, kPreBufSize, PROT_READ | PROT_WRITE,
+                             MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
+        struct ibv_mr* new_mr = nullptr;
+        if (new_buf == MAP_FAILED) {
+            new_buf = nullptr;
+            if (dbg) fprintf(dbg, "mmap pre_buf failed: %s\n", strerror(errno));
+        } else {
+            new_mr = ibv_reg_mr(new_pd, new_buf, kPreBufSize, IBV_ACCESS_LOCAL_WRITE);
+            if (!new_mr) {
+                if (dbg) fprintf(dbg, "ibv_reg_mr pre_buf failed: %s\n", strerror(errno));
+                munmap(new_buf, kPreBufSize);
+                new_buf = nullptr;
+            } else {
+                if (dbg) fprintf(dbg, "pre_buf registered: size=%zu\n", kPreBufSize);
+            }
+        }
+
+        // Atomically swap out old connection, install new one.
+        {
+            std::lock_guard<std::mutex> lock(rdma_mutex_);
+            ready_ = false;
+
+            // Tear down previous connection resources (if any).
+            if (pre_mr_)  { ibv_dereg_mr(pre_mr_);           pre_mr_  = nullptr; }
+            if (pre_buf_) { munmap(pre_buf_, kPreBufSize);    pre_buf_ = nullptr; }
+            if (cid_)     { rdma_destroy_id(cid_);            cid_     = nullptr; }
+            if (cq_)      { ibv_destroy_cq(cq_);              cq_      = nullptr; }
+            if (pd_)      { ibv_dealloc_pd(pd_);              pd_      = nullptr; }
+
+            cid_     = new_cid;
+            pd_      = new_pd;
+            cq_      = new_cq;
+            pre_buf_ = new_buf;
+            pre_mr_  = new_mr;
+            ready_   = true;
+        }
+        if (dbg) { fprintf(dbg, "connection ready (reconnect loop)\n"); fflush(dbg); }
     }
 
-    ready_ = true;
     if (dbg) fclose(dbg);
 }
 
@@ -214,6 +256,68 @@ RGWRdmaServer::rdma_read(const NixlRdmaToken& tok, void* local_buf, size_t len) 
 
     if (use_pre)
         memcpy(local_buf, pre_buf_, len);
+
+    return 0;
+}
+
+int
+RGWRdmaServer::rdma_write(const NixlRdmaToken& tok, const void* src, size_t len,
+                          size_t remote_offset) {
+    if (!ready_) return -ENOTCONN;
+    if (len == 0) return 0;
+
+    bool use_pre = (pre_buf_ && pre_mr_ && len <= kPreBufSize);
+
+    struct ibv_mr* tmp_mr = nullptr;
+
+    std::lock_guard<std::mutex> lock(rdma_mutex_);
+
+    void*    src_buf;
+    uint32_t lkey;
+
+    if (use_pre) {
+        memcpy(pre_buf_, src, len);
+        src_buf = pre_buf_;
+        lkey    = pre_mr_->lkey;
+    } else {
+        // Oversized: register caller's buffer for local read access
+        tmp_mr = ibv_reg_mr(pd_, const_cast<void*>(src), len, 0);
+        if (!tmp_mr) return -errno;
+        src_buf = const_cast<void*>(src);
+        lkey    = tmp_mr->lkey;
+    }
+
+    struct ibv_sge sge{};
+    sge.addr   = reinterpret_cast<uint64_t>(src_buf);
+    sge.length = static_cast<uint32_t>(len);
+    sge.lkey   = lkey;
+
+    struct ibv_send_wr wr{}, *bad_wr = nullptr;
+    wr.wr_id               = reinterpret_cast<uint64_t>(src_buf);
+    wr.opcode              = IBV_WR_RDMA_WRITE;
+    wr.send_flags          = IBV_SEND_SIGNALED;
+    wr.sg_list             = &sge;
+    wr.num_sge             = 1;
+    wr.wr.rdma.remote_addr = tok.addr + remote_offset;
+    wr.wr.rdma.rkey        = tok.rkey;
+
+    int ret = ibv_post_send(cid_->qp, &wr, &bad_wr);
+    if (ret != 0) {
+        if (tmp_mr) ibv_dereg_mr(tmp_mr);
+        return -ret;
+    }
+
+    struct ibv_wc wc{};
+    int nc;
+    do { nc = ibv_poll_cq(cq_, 1, &wc); } while (nc == 0);
+
+    if (tmp_mr) ibv_dereg_mr(tmp_mr);
+
+    if (nc < 0 || wc.status != IBV_WC_SUCCESS) {
+        fprintf(stderr, "RGWRdmaServer: RDMA_WRITE failed, wc.status=%s\n",
+                ibv_wc_status_str(wc.status));
+        return -EIO;
+    }
 
     return 0;
 }

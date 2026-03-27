@@ -1,6 +1,7 @@
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
 // vim: ts=8 sw=2 smarttab ft=cpp
 
+#include <chrono>
 #include <cstdint>
 #include <errno.h>
 #include <array>
@@ -70,6 +71,8 @@
 #include "rgw_sal_rados.h"
 
 #include "rgw_s3select.h"
+#include "rgw_rdma.h"
+#include <mutex>
 
 #define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_rgw
@@ -305,6 +308,13 @@ int RGWGetObj_ObjStore_S3::get_params(optional_yield y)
 
   dst_zone_trace = s->info.args.get(RGW_SYS_PARAM_PREFIX "if-not-replicated-to");
 
+  // Check for RDMA token: NIXL GET RDMA path sends x-amz-rdma-token with its
+  // receive buffer registration so RGW can RDMA_WRITE data directly to NIXL.
+  const char* rdma_hdr = s->info.env->get("HTTP_X_AMZ_RDMA_TOKEN");
+  if (rdma_hdr && RGWRdmaServer::parse_token(rdma_hdr, rdma_get_tok_)) {
+    rdma_get_active_ = true;
+  }
+
   return RGWGetObj_ObjStore::get_params(y);
 }
 
@@ -424,6 +434,7 @@ int RGWGetObj_ObjStore_S3::send_response_data(bufferlist& bl, off_t bl_ofs,
   for (auto &it : crypt_http_responses)
     dump_header(s, it.first, it.second);
 
+  if (rdma_get_active_) total_len = 0;  // body will be empty; data delivered via RDMA_WRITE
   dump_content_length(s, total_len);
   dump_last_modified(s, lastmod);
   dump_header_if_nonempty(s, "x-amz-version-id", version_id);
@@ -592,6 +603,28 @@ done:
   sent_header = true;
 
 send_data:
+  if (rdma_get_active_) {
+    if (bl_len > 0 && get_data && !op_ret) {
+      auto t0 = std::chrono::steady_clock::now();
+      int r = RGWRdmaServer::instance().rdma_write(
+          rdma_get_tok_, bl.c_str() + bl_ofs, bl_len, rdma_write_offset_);
+      if (r < 0) {
+        ldpp_dout(this, 0) << "ERROR rdma_write(): len=" << bl_len
+                           << " offset=" << rdma_write_offset_
+                           << " ret=" << r << dendl;
+        return r;
+      }
+      rdma_write_offset_ += bl_len;
+      auto t1 = std::chrono::steady_clock::now();
+      ldpp_dout(this, 0) << "TIMING rdma_write(): len=" << bl_len
+                         << " offset=" << (rdma_write_offset_ - bl_len)
+                         << " rdma_write="
+                         << std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count()
+                         << "ms" << dendl;
+    }
+    return 0;
+  }
+
   if (get_data && !op_ret) {
     int r = dump_body(s, bl.c_str() + bl_ofs, bl_len);
     if (r < 0)
@@ -2693,6 +2726,64 @@ int RGWPutObj_ObjStore_S3::get_params(optional_yield y)
 
 int RGWPutObj_ObjStore_S3::get_data(bufferlist& bl)
 {
+  // Check for RDMA token header (set by NIXL when decoupled data plane is active)
+  const char* rdma_hdr = s->info.env->get("HTTP_X_AMZ_RDMA_TOKEN");
+  if (rdma_hdr) {
+    // Lazily start the RDMA CM server on first RDMA PUT request
+    static std::once_flag rdma_init;
+    std::call_once(rdma_init, []() {
+      RGWRdmaServer::instance().start(7471);
+    });
+
+    if (!rdma_done_) {
+      // First call: parse token and execute RDMA_READ
+      NixlRdmaToken tok{};
+      if (!RGWRdmaServer::parse_token(rdma_hdr, tok)) {
+        ldpp_dout(this, 0) << "RGW RDMA: failed to parse x-amz-rdma-token" << dendl;
+        return -EINVAL;
+      }
+      if (!RGWRdmaServer::instance().is_ready()) {
+        ldpp_dout(this, 0) << "RGW RDMA: server not ready" << dendl;
+        return -EIO;
+      }
+
+      rdma_buf_len_ = tok.length;
+      rdma_buf_ = malloc(tok.length);
+      if (!rdma_buf_) return -ENOMEM;
+
+      auto t_rdma_start = std::chrono::steady_clock::now();
+      int ret = RGWRdmaServer::instance().rdma_read(tok, rdma_buf_, tok.length);
+      auto t_rdma_end = std::chrono::steady_clock::now();
+      if (ret < 0) {
+        ldpp_dout(this, 0) << "RGW RDMA: rdma_read failed: " << ret << dendl;
+        free(rdma_buf_); rdma_buf_ = nullptr;
+        return ret;
+      }
+      rdma_done_    = true;
+      rdma_buf_ofs_ = 0;
+      ldpp_dout(this, 0) << "TIMING rdma_read(): "
+        << "len=" << tok.length << " "
+        << "rdma_read=" << std::chrono::duration_cast<std::chrono::milliseconds>(t_rdma_end - t_rdma_start).count() << "ms"
+        << dendl;
+    }
+
+    // EOF: all data has been fed into the filter chain
+    if (rdma_buf_ofs_ >= rdma_buf_len_) {
+      free(rdma_buf_); rdma_buf_ = nullptr;
+      const int ret_auth = do_aws4_auth_completion();
+      return ret_auth < 0 ? ret_auth : 0;
+    }
+
+    // Return next chunk (up to rgw_max_chunk_size) from the RDMA buffer
+    uint64_t chunk     = s->cct->_conf->rgw_max_chunk_size;
+    uint64_t remaining = rdma_buf_len_ - rdma_buf_ofs_;
+    uint64_t to_copy   = std::min(chunk, remaining);
+    bl.append(reinterpret_cast<char*>(rdma_buf_) + rdma_buf_ofs_, to_copy);
+    rdma_buf_ofs_ += to_copy;
+    return static_cast<int>(to_copy);
+  }
+
+  // Existing TCP path
   const int ret = RGWPutObj_ObjStore::get_data(bl);
   if (ret == 0) {
     const int ret_auth = do_aws4_auth_completion();

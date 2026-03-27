@@ -28,6 +28,7 @@
 #include "rgw_auth.h"
 #include "rgw_auth_filters.h"
 #include "rgw_sts.h"
+#include "rgw_rdma.h"
 
 struct rgw_http_error {
   int http_ret;
@@ -44,6 +45,10 @@ protected:
   int custom_http_ret = 0;
   std::map<std::string, std::string> crypt_http_responses;
   int override_range_hdr(const rgw::auth::StrategyRegistry& auth_registry, optional_yield y);
+  // RDMA GET state: set in get_params() when client sends x-amz-rdma-token
+  NixlRdmaToken rdma_get_tok_{};
+  bool          rdma_get_active_{false};
+  size_t        rdma_write_offset_{0};
 public:
   RGWGetObj_ObjStore_S3() {}
   ~RGWGetObj_ObjStore_S3() override {}
@@ -268,10 +273,17 @@ public:
 class RGWPutObj_ObjStore_S3 : public RGWPutObj_ObjStore {
 private:
   std::map<std::string, std::string> crypt_http_responses;
+  // RDMA PUT state: set on first get_data() call when x-amz-rdma-token header present
+  bool     rdma_done_    = false;
+  void*    rdma_buf_     = nullptr;
+  uint64_t rdma_buf_len_ = 0;
+  uint64_t rdma_buf_ofs_ = 0;
 
 public:
   RGWPutObj_ObjStore_S3() {}
-  ~RGWPutObj_ObjStore_S3() override {}
+  ~RGWPutObj_ObjStore_S3() override {
+    if (rdma_buf_) { free(rdma_buf_); rdma_buf_ = nullptr; }
+  }
 
   int get_params(optional_yield y) override;
   int get_data(bufferlist& bl) override;
