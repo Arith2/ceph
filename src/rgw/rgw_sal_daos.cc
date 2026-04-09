@@ -551,6 +551,14 @@ int DaosBucket::close(const DoutPrefixProvider* dpp) {
     return 0;
   }
 
+  // Borrowed from store-level ds3_bucket_cache: do NOT close the
+  // shared handle here; the store owns its lifetime.
+  if (ds3b_borrowed) {
+    ds3b = nullptr;
+    ds3b_borrowed = false;
+    return 0;
+  }
+
   int ret = ds3_bucket_close(ds3b, nullptr);
   ds3b = nullptr;
   ldpp_dout(dpp, 20) << "DEBUG: ds3_bucket_close ret=" << ret << dendl;
@@ -638,12 +646,14 @@ int DaosBucket::load_bucket(const DoutPrefixProvider* dpp, optional_yield y,
   RGW_US("daos_load_bucket_enter");
   ldpp_dout(dpp, 20) << "DEBUG: load_bucket(): bucket name=" << get_name()
                      << dendl;
-  int ret = open(dpp);
-  if (ret != 0) {
-    return ret;
-  }
 
-  // Fast path: process-wide bucket info cache
+  // Fast path: process-wide bucket info cache. Check BEFORE the libdaos
+  // ds3_bucket_open path so the warm path doesn't serialize on libdaos's
+  // per-handle mutex. We still need a valid ds3b on this DaosBucket
+  // instance, but we borrow it from the store-level ds3_bucket_cache
+  // (which already shares one ds3b handle per bucket name across the
+  // whole RGW process). Track ownership so ~DaosBucket doesn't close the
+  // shared handle.
   {
     std::shared_lock lk(_bucket_info_cache_mu);
     auto it = _bucket_info_cache.find(get_name());
@@ -652,9 +662,24 @@ int DaosBucket::load_bucket(const DoutPrefixProvider* dpp, optional_yield y,
       attrs = it->second.attrs;
       mtime = it->second.mtime;
       bucket_version = it->second.bucket_version;
+      // Borrow the shared ds3b from the store-level cache.
+      ds3_bucket_t* shared_b = nullptr;
+      int rc = store->get_or_open_bucket(get_name(), &shared_b);
+      if (rc == 0 && shared_b != nullptr) {
+        ds3b = shared_b;
+        ds3b_borrowed = true;
+      }
       RGW_US("daos_load_bucket_cache_hit");
       return 0;
     }
+  }
+
+  // Cache miss: do the slow path including open() and the RPC. open() may
+  // also borrow from the store cache via the same path; we leave that to
+  // the existing implementation.
+  int ret = open(dpp);
+  if (ret != 0) {
+    return ret;
   }
 
   RGW_US("daos_load_bucket_before_rpc");

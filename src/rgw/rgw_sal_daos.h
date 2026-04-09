@@ -262,6 +262,10 @@ class DaosBucket : public StoreBucket {
  public:
   /** Container ds3b handle */
   ds3_bucket_t* ds3b = nullptr;
+  // BENCH-DIAGNOSTIC: when true, ds3b was borrowed from the store-level
+  // ds3_bucket_cache (shared handle); ~DaosBucket must NOT call
+  // ds3_bucket_close on it.
+  bool ds3b_borrowed = false;
 
   DaosBucket(DaosStore* _st) : store(_st), acls() {}
 
