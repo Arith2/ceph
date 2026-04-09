@@ -2797,6 +2797,11 @@ int RGWPutObj_ObjStore_S3::get_data(bufferlist& bl)
   // Check for RDMA token header (set by NIXL when decoupled data plane is active)
   const char* rdma_hdr = s->info.env->get("HTTP_X_AMZ_RDMA_TOKEN");
   if (rdma_hdr) {
+    // Stamp this RGW worker thread with the NIXL request id so all
+    // RGW_US probes on this thread carry it (cleared at function exit).
+    const char* rid_hdr = s->info.env->get("HTTP_X_NIXL_REQ_ID");
+    uint64_t _nixl_rid = rid_hdr ? strtoull(rid_hdr, nullptr, 10) : 0;
+    RGW_US_SET(_nixl_rid);
     RGW_US("get_data_enter");
     // Lazily start the RDMA CM server on first RDMA PUT request
     static std::once_flag rdma_init;
@@ -2809,11 +2814,11 @@ int RGWPutObj_ObjStore_S3::get_data(bufferlist& bl)
       NixlRdmaToken tok{};
       if (!RGWRdmaServer::parse_token(rdma_hdr, tok)) {
         ldpp_dout(this, 0) << "RGW RDMA: failed to parse x-amz-rdma-token" << dendl;
-        return -EINVAL;
+        RGW_US_CLR(); return -EINVAL;
       }
       if (!RGWRdmaServer::instance().is_ready()) {
         ldpp_dout(this, 0) << "RGW RDMA: server not ready" << dendl;
-        return -EIO;
+        RGW_US_CLR(); return -EIO;
       }
 
       rdma_buf_len_   = tok.length;
@@ -2831,7 +2836,7 @@ int RGWPutObj_ObjStore_S3::get_data(bufferlist& bl)
       RGW_US("get_data_eof_call");
       const int ret_auth = do_aws4_auth_completion();
       RGW_US("after_aws4_auth");
-      return ret_auth < 0 ? ret_auth : 0;
+      int _r = ret_auth < 0 ? ret_auth : 0; RGW_US_CLR(); return _r;
     }
 
     // Parallel batch RDMA_READ: posts all 4 MiB WRs simultaneously, then
@@ -2849,7 +2854,7 @@ int RGWPutObj_ObjStore_S3::get_data(bufferlist& bl)
     RGW_US("after_rdma_read_batch");
     if (ret < 0) {
       ldpp_dout(this, 0) << "RGW RDMA: rdma_read_batch failed: " << ret << dendl;
-      return ret;
+      RGW_US_CLR(); return ret;
     }
 
     auto t1 = sc::now();
@@ -2862,7 +2867,7 @@ int RGWPutObj_ObjStore_S3::get_data(bufferlist& bl)
         rdma_buf_len_, reinterpret_cast<char*>(srv.put_buf())));
     rdma_buf_ofs_ = rdma_buf_len_;
     RGW_US("get_data_return_bl");
-    return static_cast<int>(rdma_buf_len_);
+    int _rl = static_cast<int>(rdma_buf_len_); RGW_US_CLR(); return _rl;
   }
 
   // Existing TCP path

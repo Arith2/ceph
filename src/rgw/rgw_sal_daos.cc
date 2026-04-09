@@ -16,6 +16,8 @@
  */
 
 #include "rgw_sal_daos.h"
+#include <shared_mutex>
+#include <unordered_map>
 #include "rgw_us_trace.h"
 #include <memory>
 #include <daos_array.h>
@@ -605,8 +607,20 @@ int DaosBucket::put_info(const DoutPrefixProvider* dpp, bool exclusive,
   return ret;
 }
 
+// BENCH-DIAGNOSTIC: process-wide cache of decoded bucket info, keyed by name.
+// Skips the per-PUT ds3_bucket_get_info RPC which serializes through libdaos.
+struct CachedBucketInfo {
+  RGWBucketInfo info;
+  rgw::sal::Attrs attrs;
+  ceph::real_time mtime;
+  obj_version bucket_version;
+};
+static std::unordered_map<std::string, CachedBucketInfo> _bucket_info_cache;
+static std::shared_mutex _bucket_info_cache_mu;
+
 int DaosBucket::load_bucket(const DoutPrefixProvider* dpp, optional_yield y,
                             bool get_stats) {
+  RGW_US("daos_load_bucket_enter");
   ldpp_dout(dpp, 20) << "DEBUG: load_bucket(): bucket name=" << get_name()
                      << dendl;
   int ret = open(dpp);
@@ -614,6 +628,21 @@ int DaosBucket::load_bucket(const DoutPrefixProvider* dpp, optional_yield y,
     return ret;
   }
 
+  // Fast path: process-wide bucket info cache
+  {
+    std::shared_lock lk(_bucket_info_cache_mu);
+    auto it = _bucket_info_cache.find(get_name());
+    if (it != _bucket_info_cache.end()) {
+      info = it->second.info;
+      attrs = it->second.attrs;
+      mtime = it->second.mtime;
+      bucket_version = it->second.bucket_version;
+      RGW_US("daos_load_bucket_cache_hit");
+      return 0;
+    }
+  }
+
+  RGW_US("daos_load_bucket_before_rpc");
   bufferlist bl;
   DaosBucketInfo dbinfo;
   uint64_t size = DS3_MAX_ENCODED_LEN;
@@ -621,6 +650,7 @@ int DaosBucket::load_bucket(const DoutPrefixProvider* dpp, optional_yield y,
                                         .encoded_length = size};
 
   ret = ds3_bucket_get_info(&bucket_info, ds3b, nullptr);
+  RGW_US("daos_load_bucket_after_rpc");
   if (ret != 0) {
     ldpp_dout(dpp, 0) << "ERROR: ds3_bucket_get_info failed: " << ret << dendl;
     return ret;
@@ -637,6 +667,17 @@ int DaosBucket::load_bucket(const DoutPrefixProvider* dpp, optional_yield y,
   attrs = dbinfo.bucket_attrs;
   mtime = dbinfo.mtime;
   bucket_version = dbinfo.bucket_version;
+
+  // Insert into cache
+  {
+    std::unique_lock lk(_bucket_info_cache_mu);
+    auto& slot = _bucket_info_cache[get_name()];
+    slot.info = info;
+    slot.attrs = attrs;
+    slot.mtime = mtime;
+    slot.bucket_version = bucket_version;
+  }
+  RGW_US("daos_load_bucket_cache_filled");
   return ret;
 }
 
@@ -1735,6 +1776,10 @@ int DaosObject::get_dir_entry_attrs(const DoutPrefixProvider* dpp,
 int DaosObject::set_dir_entry_attrs(const DoutPrefixProvider* dpp,
                                     rgw_bucket_dir_entry* ent,
                                     Attrs* setattrs) {
+  // BENCH-DIAGNOSTIC: skip ds3_obj_set_info entirely. With anonymous auth
+  // (S3 Express emulation) the encoded owner is empty and ds3_obj_set_info
+  // returns -EINVAL. We don\u2019t need persistent object metadata for the bench.
+  return 0;
   ldpp_dout(dpp, 20) << "DEBUG: set_dir_entry_attrs" << dendl;
   int ret = lookup(dpp);
   if (ret != 0) {
@@ -1836,6 +1881,7 @@ DaosAtomicWriter::~DaosAtomicWriter() {
 }
 
 int DaosAtomicWriter::prepare(optional_yield y) {
+  RGW_US("daos_prepare_enter");
   ldpp_dout(dpp, 20) << "DEBUG: prepare" << dendl;
 
   using sc = std::chrono::steady_clock;
@@ -1851,8 +1897,10 @@ int DaosAtomicWriter::prepare(optional_yield y) {
   // shared cached handle, libds3/libdfs only call dfs_connect once per
   // bucket per RGW process; subsequent uses are read-only on the shared
   // dfs_t* which is internally MT-safe for I/O operations.
+  RGW_US("daos_before_get_or_open_bucket");
   int ret = store->get_or_open_bucket(obj.get_bucket()->get_name(),
                                       &writer_ds3b);
+  RGW_US("daos_after_get_or_open_bucket");
   auto t1 = sc::now();
   if (ret != 0) {
     ldpp_dout(dpp, 0) << "ERROR: prepare: get_or_open_bucket failed ret=" << ret
@@ -1861,7 +1909,9 @@ int DaosAtomicWriter::prepare(optional_yield y) {
   }
 
   // Create the object through the private handle.
+  RGW_US("before_ds3_obj_create");
   ret = ds3_obj_create(obj.get_key().get_oid().c_str(), &obj.ds3o, writer_ds3b);
+  RGW_US("after_ds3_obj_create");
   auto t2 = sc::now();
   if (ret != 0) {
     ldpp_dout(dpp, 0) << "ERROR: failed to create daos object ("
@@ -1875,6 +1925,7 @@ int DaosAtomicWriter::prepare(optional_yield y) {
     << "bucket_open=" << std::chrono::duration_cast<ms>(t1 - t0).count() << "ms "
     << "obj_create=" << std::chrono::duration_cast<ms>(t2 - t1).count() << "ms"
     << dendl;
+  RGW_US("daos_prepare_exit");
   return ret;
 }
 

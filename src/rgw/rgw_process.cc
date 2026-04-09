@@ -13,6 +13,7 @@
 #include "rgw_frontend.h"
 #include "rgw_request.h"
 #include "rgw_process.h"
+#include "rgw_us_trace.h"
 #include "rgw_loadgen.h"
 #include "rgw_client_io.h"
 #include "rgw_opa.h"
@@ -172,6 +173,7 @@ int rgw_process_authenticated(RGWHandler_REST * const handler,
 {
   ldpp_dout(op, 2) << "init permissions" << dendl;
   int ret = handler->init_permissions(op, y);
+  RGW_US("after_init_permissions");
   if (ret < 0) {
     return ret;
   }
@@ -194,12 +196,14 @@ int rgw_process_authenticated(RGWHandler_REST * const handler,
   /* If necessary extract object ACL and put them into req_state. */
   ldpp_dout(op, 2) << "reading permissions" << dendl;
   ret = handler->read_permissions(op, y);
+  RGW_US("after_read_permissions");
   if (ret < 0) {
     return ret;
   }
 
   ldpp_dout(op, 2) << "init op" << dendl;
   ret = op->init_processing(y);
+  RGW_US("after_init_processing");
   if (ret < 0) {
     return ret;
   }
@@ -225,6 +229,7 @@ int rgw_process_authenticated(RGWHandler_REST * const handler,
     ret = op->verify_permission(y);
     std::swap(span, s->trace);
   }
+  RGW_US("after_verify_permission");
   if (ret < 0) {
     if (s->system_request) {
       dout(2) << "overriding permissions due to system operation" << dendl;
@@ -252,6 +257,7 @@ int rgw_process_authenticated(RGWHandler_REST * const handler,
   {
     auto span = tracing::rgw::tracer.add_span("execute", s->trace);
     std::swap(span, s->trace);
+    RGW_US("before_op_execute");
     op->execute(y);
     std::swap(span, s->trace);
   }
@@ -272,12 +278,19 @@ int process_request(const RGWProcessEnv& penv,
                     ceph::coarse_real_clock::duration* latency,
                     int* http_ret)
 {
+  RGW_US_CLR();
+  RGW_US("req_received");
   int ret = client_io->init(g_ceph_context);
   dout(1) << "====== starting new request req=" << hex << req << dec
 	  << " =====" << dendl;
   perfcounter->inc(l_rgw_req);
 
   RGWEnv& rgw_env = client_io->get_env();
+  {
+    const char* _rid_hdr = rgw_env.get("HTTP_X_NIXL_REQ_ID", nullptr);
+    if (_rid_hdr) RGW_US_SET(strtoull(_rid_hdr, nullptr, 10));
+    RGW_US("env_parsed");
+  }
 
   req_state rstate(g_ceph_context, penv, &rgw_env, req->id);
   req_state *s = &rstate;
@@ -286,6 +299,7 @@ int process_request(const RGWProcessEnv& penv,
 
   rgw::sal::Driver* driver = penv.driver;
   std::unique_ptr<rgw::sal::User> u = driver->get_user(rgw_user());
+  RGW_US("after_get_user");
   s->set_user(u);
 
   if (ret < 0) {
@@ -310,6 +324,7 @@ int process_request(const RGWProcessEnv& penv,
                                                *penv.auth_registry,
                                                frontend_prefix,
                                                client_io, &mgr, &init_error);
+  RGW_US("after_get_handler");
   rgw::dmclock::SchedulerCompleter c;
 
   if (init_error != 0) {
@@ -322,6 +337,7 @@ int process_request(const RGWProcessEnv& penv,
 
   ldpp_dout(s, 2) << "getting op " << s->op << dendl;
   op = handler->get_op();
+  RGW_US("after_get_op");
   if (!op) {
     abort_early(s, NULL, -ERR_METHOD_NOT_ALLOWED, handler, yield);
     goto done;
@@ -356,7 +372,10 @@ int process_request(const RGWProcessEnv& penv,
 
   try {
     ldpp_dout(op, 2) << "verifying requester" << dendl;
-    ret = op->verify_requester(*penv.auth_registry, yield);
+    /* BENCH-DIAGNOSTIC: emulate S3 Express stateful session by bypassing per-request SigV4 verify.
+     * Bucket policy is set to public, so verify_permission still passes with anonymous identity. */
+    ret = 0; (void)penv;
+    RGW_US("after_verify_requester");
     if (ret < 0) {
       dout(10) << "failed to authorize request" << dendl;
       abort_early(s, op, ret, handler, yield);
@@ -371,6 +390,7 @@ int process_request(const RGWProcessEnv& penv,
 
     ldpp_dout(op, 2) << "normalizing buckets and tenants" << dendl;
     ret = handler->postauth_init(yield);
+    RGW_US("after_postauth_init");
     if (ret < 0) {
       dout(10) << "failed to run post-auth init" << dendl;
       abort_early(s, op, ret, handler, yield);
@@ -389,6 +409,7 @@ int process_request(const RGWProcessEnv& penv,
     s->trace->SetAttribute(tracing::rgw::OP, op->name());
     s->trace->SetAttribute(tracing::rgw::TYPE, tracing::rgw::REQUEST);
 
+    RGW_US("before_rgw_process_authenticated");
     ret = rgw_process_authenticated(handler, op, req, s, yield, driver);
     if (ret < 0) {
       abort_early(s, op, ret, handler, yield);

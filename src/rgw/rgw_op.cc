@@ -26,6 +26,7 @@
 #include "rgw_rados.h"
 #include "rgw_zone.h"
 #include "rgw_op.h"
+#include "rgw_us_trace.h"
 #include "rgw_rest.h"
 #include "rgw_acl.h"
 #include "rgw_acl_s3.h"
@@ -4129,7 +4130,9 @@ void RGWPutObj::execute(optional_yield y)
 					 pdest_placement, olh_epoch, s->req_id);
   }
 
+  RGW_US("before_processor_prepare");
   op_ret = processor->prepare(s->yield);
+  RGW_US("after_processor_prepare");
   if (op_ret < 0) {
     ldpp_dout(this, 20) << "processor->prepare() returned ret=" << op_ret
 		      << dendl;

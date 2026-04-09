@@ -6,6 +6,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
@@ -32,6 +33,18 @@ inline bool enabled() {
     return en;
 }
 
+// Thread-local current request id.  Set by rgw_rest_s3.cc after parsing
+// the x-nixl-req-id header; read by every emit() on the same thread.
+// Probes that fire on other threads (e.g. daos_eq progress thread) will
+// see req_id=0 and must be matched by thread+time instead.
+inline uint64_t& tls_req_id() {
+    static thread_local uint64_t rid = 0;
+    return rid;
+}
+
+inline void set_req_id(uint64_t rid) { tls_req_id() = rid; }
+inline void clear_req_id()           { tls_req_id() = 0; }
+
 inline void emit(const char* event) {
     if (!enabled()) return;
     FILE* f = fp();
@@ -39,11 +52,25 @@ inline void emit(const char* event) {
     auto now = std::chrono::system_clock::now().time_since_epoch();
     double ts = std::chrono::duration_cast<std::chrono::microseconds>(now).count() / 1e6;
     long tid = (long)syscall(SYS_gettid);
-    std::fprintf(f, "%.6f %ld %s\n", ts, tid, event);
+    std::fprintf(f, "%.6f %ld %lu %s\n", ts, tid,
+                 (unsigned long)tls_req_id(), event);
+}
+
+inline void emit_r(const char* event, uint64_t rid) {
+    if (!enabled()) return;
+    FILE* f = fp();
+    if (!f) return;
+    auto now = std::chrono::system_clock::now().time_since_epoch();
+    double ts = std::chrono::duration_cast<std::chrono::microseconds>(now).count() / 1e6;
+    long tid = (long)syscall(SYS_gettid);
+    std::fprintf(f, "%.6f %ld %lu %s\n", ts, tid, (unsigned long)rid, event);
 }
 
 }  // namespace rgw_us_trace_ns
 
-#define RGW_US(name) ::rgw_us_trace_ns::emit(name)
+#define RGW_US(name)         ::rgw_us_trace_ns::emit(name)
+#define RGW_US_R(name, rid)  ::rgw_us_trace_ns::emit_r(name, rid)
+#define RGW_US_SET(rid)      ::rgw_us_trace_ns::set_req_id(rid)
+#define RGW_US_CLR()         ::rgw_us_trace_ns::clear_req_id()
 
 #endif
