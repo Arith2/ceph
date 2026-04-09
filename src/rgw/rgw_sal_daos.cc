@@ -156,6 +156,12 @@ static inline dfs_obj_t* dfsobj_of(ds3_obj_t *o) {
 // progress thread at RGW startup, avoiding a 589 ms stall on the first
 // concurrent request batch (lazy daos_eq_create() blocks all callers
 // of std::call_once until it returns).
+
+// Per-request EQ helper (option B).
+static inline bool per_req_eq_enabled() {
+  static const bool en = (std::getenv("DAOS_PER_REQ_EQ") != nullptr);
+  return en;
+}
 void
 ensure_progress_thread_started() {
     std::call_once(g_progress_once, init_progress_thread);
@@ -1878,6 +1884,11 @@ DaosAtomicWriter::~DaosAtomicWriter() {
   }
   // writer_ds3b is owned by DaosStore::ds3_bucket_cache; do not close.
   writer_ds3b = nullptr;
+  if (writer_eq_owned && writer_eq.cookie != 0) {
+    daos_eq_destroy(writer_eq, 0);
+    writer_eq = DAOS_HDL_INVAL;
+    writer_eq_owned = false;
+  }
 }
 
 int DaosAtomicWriter::prepare(optional_yield y) {
@@ -1925,6 +1936,18 @@ int DaosAtomicWriter::prepare(optional_yield y) {
     << "bucket_open=" << std::chrono::duration_cast<ms>(t1 - t0).count() << "ms "
     << "obj_create=" << std::chrono::duration_cast<ms>(t2 - t1).count() << "ms"
     << dendl;
+  if (ret == 0 && per_req_eq_enabled()) {
+    RGW_US("daos_writer_eq_create_start");
+    int eq_rc = daos_eq_create(&writer_eq);
+    RGW_US("daos_writer_eq_create_done");
+    if (eq_rc != 0) {
+      ldpp_dout(dpp, 0) << "ERROR: daos_eq_create failed: " << eq_rc << dendl;
+      writer_eq = DAOS_HDL_INVAL;
+      writer_eq_owned = false;
+    } else {
+      writer_eq_owned = true;
+    }
+  }
   RGW_US("daos_prepare_exit");
   return ret;
 }
@@ -1955,11 +1978,20 @@ int DaosAtomicWriter::process(bufferlist&& data, uint64_t offset) {
 
   // If a previous async write is still in-flight (multi-chunk object), wait
   // for it to complete before submitting the next chunk.
-  if (write_submitted && waiter_) {
-    // Block on condvar; progress thread fires the callback in its own context.
-    std::unique_lock<std::mutex> lock(waiter_->mtx);
-    waiter_->cv.wait(lock, [this]{ return waiter_->done; });
-    int ev_ret = waiter_->err;
+  if (write_submitted) {
+    int ev_ret = 0;
+    if (per_req_eq_enabled() && writer_eq_owned) {
+      daos_event_t *evp = nullptr;
+      while (true) {
+        int n = daos_eq_poll(writer_eq, 1, DAOS_EQ_WAIT, 1, &evp);
+        if (n > 0) { ev_ret = evp->ev_error; break; }
+        if (n < 0) { ev_ret = n; break; }
+      }
+    } else if (waiter_) {
+      std::unique_lock<std::mutex> lock(waiter_->mtx);
+      waiter_->cv.wait(lock, [this]{ return waiter_->done; });
+      ev_ret = waiter_->err;
+    }
     daos_event_fini(&write_ev);
     write_submitted = false;
     waiter_.reset();
@@ -1979,10 +2011,17 @@ int DaosAtomicWriter::process(bufferlist&& data, uint64_t offset) {
   // Submit the write asynchronously and return immediately.  Concurrent PUT
   // requests in other threads can now also submit their writes, giving DAOS
   // the same iodepth effect that fio achieves with --iodepth=N.
-  waiter_ = std::make_unique<rgw::sal::DaosReqWaiter>();
-  daos_event_init(&write_ev, get_progress_eq(), nullptr);
-  daos_event_register_comp_cb(&write_ev, daos_progress_completion_cb,
-                              waiter_.get());
+  // Per-request EQ path: submit on writer_eq, no callback needed; complete()
+  // will poll writer_eq directly. Otherwise fall back to shared progress EQ.
+  if (per_req_eq_enabled() && writer_eq_owned) {
+    daos_event_init(&write_ev, writer_eq, nullptr);
+    waiter_.reset();  // not used in per-request EQ mode
+  } else {
+    waiter_ = std::make_unique<rgw::sal::DaosReqWaiter>();
+    daos_event_init(&write_ev, get_progress_eq(), nullptr);
+    daos_event_register_comp_cb(&write_ev, daos_progress_completion_cb,
+                                waiter_.get());
+  }
   uint64_t size = data_size;
   RGW_US("before_ds3_obj_write_submit");
   int ret;
@@ -2036,12 +2075,22 @@ int DaosAtomicWriter::complete(
   // Wait for the async data write submitted in process() to complete before
   // writing metadata.  All concurrent writers reach this point independently,
   // so their DAOS writes have been in-flight simultaneously.
-  if (write_submitted && waiter_) {
+  if (write_submitted) {
     RGW_US("before_daos_event_test");
-    {
+    if (per_req_eq_enabled() && writer_eq_owned) {
+      daos_event_t *evp = nullptr;
+      ret = 0;
+      while (true) {
+        int n = daos_eq_poll(writer_eq, 1, DAOS_EQ_WAIT, 1, &evp);
+        if (n > 0) { ret = evp->ev_error; break; }
+        if (n < 0) { ret = n; break; }
+      }
+    } else if (waiter_) {
       std::unique_lock<std::mutex> lock(waiter_->mtx);
       waiter_->cv.wait(lock, [this]{ return waiter_->done; });
       ret = waiter_->err;
+    } else {
+      ret = 0;
     }
     RGW_US("after_daos_event_test");
     daos_event_fini(&write_ev);

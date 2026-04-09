@@ -761,6 +761,13 @@ class DaosAtomicWriter : public StoreWriter {
   ceph::bufferlist pending_data;
   daos_event_t write_ev = {};
   bool write_submitted = false;
+  // Option B: per-request daos_eq, isolated from the shared progress EQ.
+  // When DAOS_PER_REQ_EQ=1, prepare() creates this EQ; process() submits
+  // events on it; complete() polls it directly (no condvar / progress
+  // thread); destructor releases it. Eliminates contention on the libdaos
+  // per-EQ mutex by giving each in-flight request its own EQ.
+  daos_handle_t writer_eq = DAOS_HDL_INVAL;
+  bool writer_eq_owned = false;
   // Option 3 (FIO mirror): per-writer condvar-based waiter signaled by the
   // progress thread on event completion. Decouples Beast worker waiting from
   // libdaos's per-EQ mutex.
