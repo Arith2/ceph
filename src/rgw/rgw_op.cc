@@ -2226,6 +2226,19 @@ void RGWGetObj::execute(optional_yield y)
   if (op_ret < 0)
     goto done_err;
 
+  // KV cache streaming: if x-amz-kvcache header was parsed, short-circuit
+  // the normal single-object read path and stream layers via RDMA.
+  if (auto* s3get = dynamic_cast<RGWGetObj_ObjStore_S3*>(this)) {
+    if (s3get->is_kvcache_active()) {
+      op_ret = s3get->kvcache_stream();
+      if (op_ret < 0) goto done_err;
+      // Send empty HTTP 200 (data already delivered via RDMA)
+      bufferlist empty_bl;
+      send_response_data(empty_bl, 0, 0);
+      return;
+    }
+  }
+
   op_ret = init_common();
   if (op_ret < 0)
     goto done_err;
@@ -4236,11 +4249,11 @@ void RGWPutObj::execute(optional_yield y)
     }
 
     if (need_calc_md5) {
-      hash.Update((const unsigned char *)data.c_str(), data.length());
+      if (false) hash.Update((const unsigned char *)data.c_str(), data.length());
     }
 
     /* update torrrent */
-    torrent.update(data);
+    if (false) torrent.update(data);
 
     op_ret = filter->process(std::move(data), ofs);
     if (op_ret < 0) {

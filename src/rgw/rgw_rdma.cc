@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: LGPL-2.1
 #include "rgw_rdma.h"
+#include "rgw_us_trace.h"
 
 #include <arpa/inet.h>
 #include <cerrno>
@@ -107,7 +108,7 @@ RGWRdmaServer::listen_loop(int port) {
             continue;
         }
 
-        struct ibv_cq* new_cq = ibv_create_cq(new_cid->verbs, 64, nullptr, nullptr, 0);
+        struct ibv_cq* new_cq = ibv_create_cq(new_cid->verbs, 128, nullptr, nullptr, 0);
         if (!new_cq) {
             if (dbg) fprintf(dbg, "ibv_create_cq failed\n");
             ibv_dealloc_pd(new_pd);
@@ -119,7 +120,7 @@ RGWRdmaServer::listen_loop(int port) {
         qp_attr.send_cq          = new_cq;
         qp_attr.recv_cq          = new_cq;
         qp_attr.qp_type          = IBV_QPT_RC;
-        qp_attr.cap.max_send_wr  = 64;
+        qp_attr.cap.max_send_wr  = 128;
         qp_attr.cap.max_recv_wr  = 1;
         qp_attr.cap.max_send_sge = 1;
         qp_attr.cap.max_recv_sge = 1;
@@ -261,6 +262,140 @@ RGWRdmaServer::rdma_read(const NixlRdmaToken& tok, void* local_buf, size_t len) 
 }
 
 int
+RGWRdmaServer::rdma_read_batch(const NixlRdmaToken& tok, size_t total_len) {
+    if (!ready_) return -ENOTCONN;
+    if (!pre_buf_ || !pre_mr_) return -ENOMEM;
+    if (total_len > kPutBufSz) return -EINVAL;
+
+    const size_t n = (total_len + kRdmaChunk - 1) / kRdmaChunk;
+
+    RGW_US("rdma_read_batch_before_lock");
+    std::lock_guard<std::mutex> lock(rdma_mutex_);
+    RGW_US("rdma_read_batch_after_lock");
+
+    // Sliding window: keep up to kMaxInflight (= max_qp_rd_atom) WRs in
+    // flight at all times.  As each completion arrives, post the next WR
+    // immediately — no idle gaps between waves.
+    size_t posted = 0, completed = 0;
+
+    // Fill the initial window.
+    while (posted < n && posted - completed < kMaxInflight) {
+        size_t off   = posted * kRdmaChunk;
+        size_t chunk = std::min(kRdmaChunk, total_len - off);
+
+        struct ibv_sge sge{};
+        sge.addr   = reinterpret_cast<uint64_t>(
+                         static_cast<uint8_t*>(pre_buf_) + off);
+        sge.length = static_cast<uint32_t>(chunk);
+        sge.lkey   = pre_mr_->lkey;
+
+        struct ibv_send_wr wr{}, *bad_wr = nullptr;
+        wr.wr_id               = posted;
+        wr.opcode              = IBV_WR_RDMA_READ;
+        wr.send_flags          = IBV_SEND_SIGNALED;
+        wr.sg_list             = &sge;
+        wr.num_sge             = 1;
+        wr.wr.rdma.remote_addr = tok.addr + off;
+        wr.wr.rdma.rkey        = tok.rkey;
+
+        int ret = ibv_post_send(cid_->qp, &wr, &bad_wr);
+        if (ret != 0) return -ret;
+        ++posted;
+    }
+
+    // Slide: poll one completion, post one new WR, repeat.
+    while (completed < n) {
+        struct ibv_wc wc{};
+        int nc;
+        do { nc = ibv_poll_cq(cq_, 1, &wc); } while (nc == 0);
+        if (nc < 0 || wc.status != IBV_WC_SUCCESS) {
+            fprintf(stderr, "RGWRdmaServer: rdma_read_batch WR %lu failed, wc.status=%s\n",
+                    (unsigned long)wc.wr_id, ibv_wc_status_str(wc.status));
+            return -EIO;
+        }
+        ++completed;
+
+        // Post next WR if any remain.
+        if (posted < n) {
+            size_t off   = posted * kRdmaChunk;
+            size_t chunk = std::min(kRdmaChunk, total_len - off);
+
+            struct ibv_sge sge{};
+            sge.addr   = reinterpret_cast<uint64_t>(
+                             static_cast<uint8_t*>(pre_buf_) + off);
+            sge.length = static_cast<uint32_t>(chunk);
+            sge.lkey   = pre_mr_->lkey;
+
+            struct ibv_send_wr wr{}, *bad_wr = nullptr;
+            wr.wr_id               = posted;
+            wr.opcode              = IBV_WR_RDMA_READ;
+            wr.send_flags          = IBV_SEND_SIGNALED;
+            wr.sg_list             = &sge;
+            wr.num_sge             = 1;
+            wr.wr.rdma.remote_addr = tok.addr + off;
+            wr.wr.rdma.rkey        = tok.rkey;
+
+            int ret = ibv_post_send(cid_->qp, &wr, &bad_wr);
+            if (ret != 0) return -ret;
+            ++posted;
+        }
+    }
+
+    return 0;
+}
+
+int
+RGWRdmaServer::rdma_read_post_all(const NixlRdmaToken& tok, size_t total_len) {
+    if (!ready_) return -ENOTCONN;
+    if (!pre_buf_ || !pre_mr_) return -ENOMEM;
+    if (total_len > kPutBufSz) return -EINVAL;
+
+    const int n = static_cast<int>((total_len + kRdmaChunk - 1) / kRdmaChunk);
+
+    std::lock_guard<std::mutex> lock(rdma_mutex_);
+
+    for (int i = 0; i < n; ++i) {
+        size_t off   = static_cast<size_t>(i) * kRdmaChunk;
+        size_t chunk = std::min(kRdmaChunk, total_len - off);
+
+        struct ibv_sge sge{};
+        sge.addr   = reinterpret_cast<uint64_t>(
+                         static_cast<uint8_t*>(pre_buf_) + off);
+        sge.length = static_cast<uint32_t>(chunk);
+        sge.lkey   = pre_mr_->lkey;
+
+        struct ibv_send_wr wr{}, *bad_wr = nullptr;
+        wr.wr_id               = static_cast<uint64_t>(i);
+        wr.opcode              = IBV_WR_RDMA_READ;
+        wr.send_flags          = IBV_SEND_SIGNALED;
+        wr.sg_list             = &sge;
+        wr.num_sge             = 1;
+        wr.wr.rdma.remote_addr = tok.addr + off;
+        wr.wr.rdma.rkey        = tok.rkey;
+
+        int ret = ibv_post_send(cid_->qp, &wr, &bad_wr);
+        if (ret != 0) return -ret;
+    }
+    return n;
+}
+
+int
+RGWRdmaServer::rdma_read_poll_one() {
+    // No mutex needed: single-threaded PUT path, and the WRs were already
+    // posted under the lock in rdma_read_post_all().  CQ polling is safe
+    // because only one PUT is in flight at a time.
+    struct ibv_wc wc{};
+    int nc;
+    do { nc = ibv_poll_cq(cq_, 1, &wc); } while (nc == 0);
+    if (nc < 0 || wc.status != IBV_WC_SUCCESS) {
+        fprintf(stderr, "RGWRdmaServer: rdma_read_poll_one failed, wc.status=%s\n",
+                ibv_wc_status_str(wc.status));
+        return -EIO;
+    }
+    return 0;
+}
+
+int
 RGWRdmaServer::rdma_write(const NixlRdmaToken& tok, const void* src, size_t len,
                           size_t remote_offset) {
     if (!ready_) return -ENOTCONN;
@@ -319,6 +454,141 @@ RGWRdmaServer::rdma_write(const NixlRdmaToken& tok, const void* src, size_t len,
         return -EIO;
     }
 
+    RGW_US("rdma_read_batch_done");
+    return 0;
+}
+
+int
+RGWRdmaServer::rdma_write_post(const NixlRdmaToken& tok, const void* src, size_t len,
+                                size_t remote_offset) {
+    if (!ready_) return -ENOTCONN;
+    if (len == 0)  return 0;
+    if (len > kGetSlotSz) return -EINVAL;  // caller must use <=4 MiB chunks
+
+    std::lock_guard<std::mutex> lock(rdma_mutex_);
+
+    // Wait for any previous non-blocking write before reusing the slot buffer.
+    if (get_write_pending_) {
+        struct ibv_wc wc{};
+        int nc;
+        do { nc = ibv_poll_cq(cq_, 1, &wc); } while (nc == 0);
+        get_write_pending_ = false;
+        if (nc < 0 || wc.status != IBV_WC_SUCCESS) {
+            fprintf(stderr, "RGWRdmaServer: rdma_write_post drain failed wc.status=%s\n",
+                    ibv_wc_status_str(wc.status));
+            return -EIO;
+        }
+    }
+
+    // Copy src into the dedicated GET staging slot (avoids ibv_reg_mr per call).
+    void* slot = static_cast<uint8_t*>(pre_buf_) + kGetSlot;
+    memcpy(slot, src, len);
+
+    struct ibv_sge sge{};
+    sge.addr   = reinterpret_cast<uint64_t>(slot);
+    sge.length = static_cast<uint32_t>(len);
+    sge.lkey   = pre_mr_->lkey;
+
+    struct ibv_send_wr wr{}, *bad_wr = nullptr;
+    wr.wr_id               = 0xbeef;
+    wr.opcode              = IBV_WR_RDMA_WRITE;
+    wr.send_flags          = IBV_SEND_SIGNALED;
+    wr.sg_list             = &sge;
+    wr.num_sge             = 1;
+    wr.wr.rdma.remote_addr = tok.addr + remote_offset;
+    wr.wr.rdma.rkey        = tok.rkey;
+
+    int ret = ibv_post_send(cid_->qp, &wr, &bad_wr);
+    if (ret != 0) return -ret;
+
+    get_write_pending_ = true;
+    return 0;
+}
+
+int
+RGWRdmaServer::rdma_write_wait() {
+    if (!get_write_pending_) return 0;
+
+    std::lock_guard<std::mutex> lock(rdma_mutex_);
+    struct ibv_wc wc{};
+    int nc;
+    do { nc = ibv_poll_cq(cq_, 1, &wc); } while (nc == 0);
+    get_write_pending_ = false;
+
+    if (nc < 0 || wc.status != IBV_WC_SUCCESS) {
+        fprintf(stderr, "RGWRdmaServer: rdma_write_wait failed wc.status=%s\n",
+                ibv_wc_status_str(wc.status));
+        return -EIO;
+    }
+    return 0;
+}
+
+int
+RGWRdmaServer::rdma_write_batch(const NixlRdmaToken& tok, const void* src,
+                                size_t total_len) {
+    if (!ready_) return -ENOTCONN;
+    if (!pre_buf_ || !pre_mr_) return -ENOMEM;
+    if (total_len > kPutBufSz) return -EINVAL;
+    if (total_len == 0) return 0;
+
+    const size_t n = (total_len + kRdmaChunk - 1) / kRdmaChunk;
+
+    std::lock_guard<std::mutex> lock(rdma_mutex_);
+
+    // Sliding window: keep up to kMaxInflight WRs in flight.
+    size_t posted = 0, completed = 0;
+
+    auto post_one = [&](size_t i) -> int {
+        size_t off   = i * kRdmaChunk;
+        size_t chunk = std::min(kRdmaChunk, total_len - off);
+
+        void* dst = static_cast<uint8_t*>(pre_buf_) + off;
+        const void* chunk_src = static_cast<const uint8_t*>(src) + off;
+        if (chunk_src != dst)
+            memcpy(dst, chunk_src, chunk);
+
+        struct ibv_sge sge{};
+        sge.addr   = reinterpret_cast<uint64_t>(dst);
+        sge.length = static_cast<uint32_t>(chunk);
+        sge.lkey   = pre_mr_->lkey;
+
+        struct ibv_send_wr wr{}, *bad_wr = nullptr;
+        wr.wr_id               = i;
+        wr.opcode              = IBV_WR_RDMA_WRITE;
+        wr.send_flags          = IBV_SEND_SIGNALED;
+        wr.sg_list             = &sge;
+        wr.num_sge             = 1;
+        wr.wr.rdma.remote_addr = tok.addr + off;
+        wr.wr.rdma.rkey        = tok.rkey;
+
+        return ibv_post_send(cid_->qp, &wr, &bad_wr);
+    };
+
+    // Fill the initial window.
+    while (posted < n && posted - completed < kMaxInflight) {
+        int ret = post_one(posted);
+        if (ret != 0) return -ret;
+        ++posted;
+    }
+
+    // Slide: poll one completion, post one new WR, repeat.
+    while (completed < n) {
+        struct ibv_wc wc{};
+        int nc;
+        do { nc = ibv_poll_cq(cq_, 1, &wc); } while (nc == 0);
+        if (nc < 0 || wc.status != IBV_WC_SUCCESS) {
+            fprintf(stderr, "RGWRdmaServer: rdma_write_batch WR %lu failed, wc.status=%s\n",
+                    (unsigned long)wc.wr_id, ibv_wc_status_str(wc.status));
+            return -EIO;
+        }
+        ++completed;
+
+        if (posted < n) {
+            int ret = post_one(posted);
+            if (ret != 0) return -ret;
+            ++posted;
+        }
+    }
     return 0;
 }
 

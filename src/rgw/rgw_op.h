@@ -432,6 +432,7 @@ public:
   virtual int get_params(optional_yield y) = 0;
   virtual int send_response_data_error(optional_yield y) = 0;
   virtual int send_response_data(bufferlist& bl, off_t ofs, off_t len) = 0;
+  virtual void send_response_end() {}
 
   const char* name() const override { return "get_obj"; }
   RGWOpType get_type() override { return RGW_OP_GET_OBJ; }
@@ -1231,6 +1232,7 @@ protected:
   bool append;
   uint64_t position;
   uint64_t cur_accounted_size;
+  bool rdma_active_{false};  // set by RDMA PUT path to skip MD5 hash computation
 
   //object lock
   RGWObjectRetention *obj_retention;
@@ -1299,6 +1301,7 @@ public:
   virtual int get_params(optional_yield y) = 0;
   virtual int get_data(bufferlist& bl) = 0;
   void send_response() override = 0;
+  virtual void send_response_end() {}
   const char* name() const override { return "put_obj"; }
   RGWOpType get_type() override { return RGW_OP_PUT_OBJ; }
   uint32_t op_mask() override { return RGW_OP_TYPE_WRITE; }

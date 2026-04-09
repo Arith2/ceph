@@ -16,6 +16,9 @@
  */
 
 #pragma once
+#include <unordered_map>
+#include <mutex>
+#include <memory>
 
 #include <daos.h>
 #include <daos_s3.h>
@@ -93,7 +96,7 @@ inline int NotImplementedGdbBreak(const DoutPrefixProvider* ldpp,
 #define DAOS_NOT_IMPLEMENTED_LOG(ldpp) \
   NotImplementedLog(ldpp, __FILE__, __LINE__, __FUNCTION__)
 
-namespace rgw::sal {
+namespace rgw::sal { struct DaosReqWaiter;
 
 class DaosStore;
 class DaosObject;
@@ -758,6 +761,10 @@ class DaosAtomicWriter : public StoreWriter {
   ceph::bufferlist pending_data;
   daos_event_t write_ev = {};
   bool write_submitted = false;
+  // Option 3 (FIO mirror): per-writer condvar-based waiter signaled by the
+  // progress thread on event completion. Decouples Beast worker waiting from
+  // libdaos's per-EQ mutex.
+  std::unique_ptr<struct DaosReqWaiter> waiter_;
   // Per-request pipeline timestamps for latency breakdown.
   std::chrono::steady_clock::time_point t_prepare_start;
   std::chrono::steady_clock::time_point t_first_process;
@@ -915,6 +922,19 @@ class DaosStore : public StoreDriver {
 
  public:
   ds3_t* ds3 = nullptr;
+  // Process-wide cache of opened ds3_bucket_t* per bucket name. libds3's
+  // ds3_bucket_open calls dfs_connect which races on container metadata
+  // when many threads call it concurrently for the same bucket. The fix
+  // is one shared handle per bucket, lazily created under a mutex.
+  std::mutex ds3_bucket_cache_mtx;
+  std::unordered_map<std::string, ds3_bucket_t*> ds3_bucket_cache;
+
+ public:
+  // Returns a shared, cached ds3_bucket_t* for the named bucket. Lazy
+  // initializes on first call. Subsequent callers reuse the same handle.
+  // Returns 0 on success and writes the handle to *out_b. Negative errno
+  // on failure.
+  int get_or_open_bucket(const std::string& name, ds3_bucket_t** out_b);
 
   CephContext* cctx;
 

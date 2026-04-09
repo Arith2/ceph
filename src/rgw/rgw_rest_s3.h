@@ -49,6 +49,15 @@ protected:
   NixlRdmaToken rdma_get_tok_{};
   bool          rdma_get_active_{false};
   size_t        rdma_write_offset_{0};
+  bool          rdma_write_pending_{false};  // true when a non-blocking write is in flight
+
+  // KV cache streaming state: set in get_params() when client sends x-amz-kvcache
+  bool          kvcache_active_{false};
+  std::vector<std::string> kvcache_chunks_;   // chunk hash keys (S3 object keys)
+  int           kvcache_num_layers_{0};
+  size_t        kvcache_kv_per_token_per_layer_{0};
+  size_t        kvcache_tokens_per_chunk_{0};
+  int           kvcache_layer_aggregate_{1};  // layers per RDMA push (1=per-layer, num_layers=bulk)
 public:
   RGWGetObj_ObjStore_S3() {}
   ~RGWGetObj_ObjStore_S3() override {}
@@ -58,6 +67,9 @@ public:
   int send_response_data_error(optional_yield y) override;
   int send_response_data(bufferlist& bl, off_t ofs, off_t len) override;
   void set_custom_http_response(int http_ret) { custom_http_ret = http_ret; }
+  void send_response_end() override;
+  int kvcache_stream();
+  bool is_kvcache_active() const { return kvcache_active_; }
   int get_decrypt_filter(std::unique_ptr<RGWGetObj_Filter>* filter,
                          RGWGetObj_Filter* cb,
                          bufferlist* manifest_bl) override;
@@ -273,17 +285,17 @@ public:
 class RGWPutObj_ObjStore_S3 : public RGWPutObj_ObjStore {
 private:
   std::map<std::string, std::string> crypt_http_responses;
-  // RDMA PUT state: set on first get_data() call when x-amz-rdma-token header present
-  bool     rdma_done_    = false;
-  void*    rdma_buf_     = nullptr;
-  uint64_t rdma_buf_len_ = 0;
-  uint64_t rdma_buf_ofs_ = 0;
+  // RDMA PUT state: parallel post + per-chunk poll pipeline
+  static constexpr size_t kRdmaChunk = 1UL << 20;  // match RGWRdmaServer::kRdmaChunk
+  bool           rdma_done_      = false;
+  bool           rdma_posted_    = false;     // true after rdma_read_post_all()
+  uint64_t       rdma_buf_len_   = 0;         // total transfer size (from token)
+  uint64_t       rdma_buf_ofs_   = 0;         // bytes fed to execute() so far
+  NixlRdmaToken  rdma_saved_tok_{};           // saved token for multi-chunk reads
 
 public:
   RGWPutObj_ObjStore_S3() {}
-  ~RGWPutObj_ObjStore_S3() override {
-    if (rdma_buf_) { free(rdma_buf_); rdma_buf_ = nullptr; }
-  }
+  ~RGWPutObj_ObjStore_S3() override = default;
 
   int get_params(optional_yield y) override;
   int get_data(bufferlist& bl) override;
@@ -291,6 +303,7 @@ public:
 
   int get_encrypt_filter(std::unique_ptr<rgw::sal::DataProcessor> *filter,
                          rgw::sal::DataProcessor *cb) override;
+  void send_response_end() override;
   int get_decrypt_filter(std::unique_ptr<RGWGetObj_Filter>* filter,
                          RGWGetObj_Filter* cb,
                          std::map<std::string, bufferlist>& attrs,

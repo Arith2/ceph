@@ -34,6 +34,7 @@
 
 #include "rgw_rest.h"
 #include "rgw_rest_s3.h"
+#include "rgw_us_trace.h"
 #include "rgw_rest_s3website.h"
 #include "rgw_rest_pubsub.h"
 #include "rgw_auth_s3.h"
@@ -72,6 +73,7 @@
 
 #include "rgw_s3select.h"
 #include "rgw_rdma.h"
+#include "picojson/picojson.h"
 #include <mutex>
 
 #define dout_context g_ceph_context
@@ -315,6 +317,36 @@ int RGWGetObj_ObjStore_S3::get_params(optional_yield y)
     rdma_get_active_ = true;
   }
 
+  // Check for KV cache streaming descriptor
+  const char* kvcache_hdr = s->info.env->get("HTTP_X_AMZ_KVCACHE");
+  if (kvcache_hdr && rdma_get_active_) {
+    picojson::value v;
+    std::string err = picojson::parse(v, std::string(kvcache_hdr));
+    if (err.empty() && v.is<picojson::object>()) {
+      auto& obj = v.get<picojson::object>();
+      if (obj.count("chunks") && obj.at("chunks").is<picojson::array>()) {
+        for (auto& c : obj.at("chunks").get<picojson::array>()) {
+          if (c.is<std::string>()) kvcache_chunks_.push_back(c.get<std::string>());
+        }
+      }
+      if (obj.count("num_layers"))
+        kvcache_num_layers_ = (int)obj.at("num_layers").get<double>();
+      if (obj.count("kv_per_token_per_layer"))
+        kvcache_kv_per_token_per_layer_ = (size_t)obj.at("kv_per_token_per_layer").get<double>();
+      if (obj.count("tokens_per_chunk"))
+        kvcache_tokens_per_chunk_ = (size_t)obj.at("tokens_per_chunk").get<double>();
+      if (obj.count("layer_aggregate"))
+        kvcache_layer_aggregate_ = (int)obj.at("layer_aggregate").get<double>();
+      if (!kvcache_chunks_.empty() && kvcache_num_layers_ > 0)
+        kvcache_active_ = true;
+      ldpp_dout(this, 0) << "x-amz-kvcache: chunks=" << kvcache_chunks_.size()
+        << " layers=" << kvcache_num_layers_
+        << " kv_per_tok_layer=" << kvcache_kv_per_token_per_layer_
+        << " tok_per_chunk=" << kvcache_tokens_per_chunk_ << " layer_agg=" << kvcache_layer_aggregate_
+        << " active=" << kvcache_active_ << dendl;
+    }
+  }
+
   return RGWGetObj_ObjStore::get_params(y);
 }
 
@@ -434,7 +466,10 @@ int RGWGetObj_ObjStore_S3::send_response_data(bufferlist& bl, off_t bl_ofs,
   for (auto &it : crypt_http_responses)
     dump_header(s, it.first, it.second);
 
-  if (rdma_get_active_) total_len = 0;  // body will be empty; data delivered via RDMA_WRITE
+  if (rdma_get_active_) {
+    total_len = 0;  // body will be empty; data delivered via RDMA_WRITE
+    dump_header(s, "x-amz-rdma-reply", "true");
+  }
   dump_content_length(s, total_len);
   dump_last_modified(s, lastmod);
   dump_header_if_nonempty(s, "x-amz-version-id", version_id);
@@ -605,23 +640,26 @@ done:
 send_data:
   if (rdma_get_active_) {
     if (bl_len > 0 && get_data && !op_ret) {
-      auto t0 = std::chrono::steady_clock::now();
-      int r = RGWRdmaServer::instance().rdma_write(
-          rdma_get_tok_, bl.c_str() + bl_ofs, bl_len, rdma_write_offset_);
+      // Parallel batch RDMA_WRITE: copies all data into pre_buf_ in 4 MiB
+      // chunks (interleaved with WR posting), posts all WRs simultaneously,
+      // then polls all completions.  This replaces the serial rdma_write_post
+      // pipeline that was limited by single-slot reuse.
+      using sc = std::chrono::steady_clock;
+      using ms = std::chrono::milliseconds;
+      auto t0 = sc::now();
+      int r = RGWRdmaServer::instance().rdma_write_batch(
+          rdma_get_tok_, bl.c_str() + bl_ofs, bl_len);
+      auto t1 = sc::now();
       if (r < 0) {
-        ldpp_dout(this, 0) << "ERROR rdma_write(): len=" << bl_len
-                           << " offset=" << rdma_write_offset_
+        ldpp_dout(this, 0) << "ERROR rdma_write_batch(): len=" << bl_len
                            << " ret=" << r << dendl;
         return r;
       }
-      rdma_write_offset_ += bl_len;
-      auto t1 = std::chrono::steady_clock::now();
-      ldpp_dout(this, 0) << "TIMING rdma_write(): len=" << bl_len
-                         << " offset=" << (rdma_write_offset_ - bl_len)
-                         << " rdma_write="
-                         << std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count()
-                         << "ms" << dendl;
+      ldpp_dout(this, 0) << "TIMING rdma_write_batch(): len=" << bl_len
+        << " rdma_total=" << std::chrono::duration_cast<ms>(t1 - t0).count()
+        << "ms" << dendl;
     }
+    // bl_len==0: no drain needed, batch is synchronous.
     return 0;
   }
 
@@ -715,6 +753,36 @@ int RGWGetObj_ObjStore_S3::override_range_hdr(const rgw::auth::StrategyRegistry&
     rgw_env->remove("HTTP_RANGE");
   }
   return ret;
+}
+
+
+
+
+int RGWGetObj_ObjStore_S3::kvcache_stream()
+{
+  return rgw::sal::kvcache_stream_daos(
+      static_cast<void*>(s->bucket.get()),
+      rdma_get_tok_,
+      kvcache_chunks_,
+      kvcache_num_layers_,
+      kvcache_kv_per_token_per_layer_,
+      kvcache_tokens_per_chunk_,
+      kvcache_layer_aggregate_,
+      this);
+}
+
+void RGWGetObj_ObjStore_S3::send_response_end()
+{
+  // Drain the last pending non-blocking RDMA_WRITE before the HTTP 200
+  // response is sent.  This ensures data has arrived at the NIXL buffer
+  // before NIXL's callback fires on receipt of the response.
+  if (rdma_get_active_ && rdma_write_pending_) {
+    int r = RGWRdmaServer::instance().rdma_write_wait();
+    if (r < 0)
+      ldpp_dout(this, 0) << "ERROR send_response_end: rdma_write_wait ret=" << r << dendl;
+    rdma_write_pending_ = false;
+  }
+  RGWGetObj_ObjStore::send_response_end();
 }
 
 
@@ -2729,6 +2797,7 @@ int RGWPutObj_ObjStore_S3::get_data(bufferlist& bl)
   // Check for RDMA token header (set by NIXL when decoupled data plane is active)
   const char* rdma_hdr = s->info.env->get("HTTP_X_AMZ_RDMA_TOKEN");
   if (rdma_hdr) {
+    RGW_US("get_data_enter");
     // Lazily start the RDMA CM server on first RDMA PUT request
     static std::once_flag rdma_init;
     std::call_once(rdma_init, []() {
@@ -2736,7 +2805,7 @@ int RGWPutObj_ObjStore_S3::get_data(bufferlist& bl)
     });
 
     if (!rdma_done_) {
-      // First call: parse token and execute RDMA_READ
+      // First call: parse token, allocate 4 MiB staging buffer, skip MD5.
       NixlRdmaToken tok{};
       if (!RGWRdmaServer::parse_token(rdma_hdr, tok)) {
         ldpp_dout(this, 0) << "RGW RDMA: failed to parse x-amz-rdma-token" << dendl;
@@ -2747,40 +2816,53 @@ int RGWPutObj_ObjStore_S3::get_data(bufferlist& bl)
         return -EIO;
       }
 
-      rdma_buf_len_ = tok.length;
-      rdma_buf_ = malloc(tok.length);
-      if (!rdma_buf_) return -ENOMEM;
-
-      auto t_rdma_start = std::chrono::steady_clock::now();
-      int ret = RGWRdmaServer::instance().rdma_read(tok, rdma_buf_, tok.length);
-      auto t_rdma_end = std::chrono::steady_clock::now();
-      if (ret < 0) {
-        ldpp_dout(this, 0) << "RGW RDMA: rdma_read failed: " << ret << dendl;
-        free(rdma_buf_); rdma_buf_ = nullptr;
-        return ret;
-      }
-      rdma_done_    = true;
-      rdma_buf_ofs_ = 0;
-      ldpp_dout(this, 0) << "TIMING rdma_read(): "
-        << "len=" << tok.length << " "
-        << "rdma_read=" << std::chrono::duration_cast<std::chrono::milliseconds>(t_rdma_end - t_rdma_start).count() << "ms"
-        << dendl;
+      rdma_buf_len_   = tok.length;
+      rdma_buf_ofs_   = 0;
+      rdma_saved_tok_ = tok;
+      rdma_done_      = true;
+      rdma_active_    = true;  // skip MD5/torrent hash in execute() loop
+      // Override content_length so the size check in execute() passes even when
+      // the HTTP request carries Content-Length: 0 (no TCP body for RDMA PUT).
+      s->content_length = static_cast<int64_t>(rdma_buf_len_);
     }
 
-    // EOF: all data has been fed into the filter chain
+    // EOF: second call after batch read delivered all data.
     if (rdma_buf_ofs_ >= rdma_buf_len_) {
-      free(rdma_buf_); rdma_buf_ = nullptr;
+      RGW_US("get_data_eof_call");
       const int ret_auth = do_aws4_auth_completion();
+      RGW_US("after_aws4_auth");
       return ret_auth < 0 ? ret_auth : 0;
     }
 
-    // Return next chunk (up to rgw_max_chunk_size) from the RDMA buffer
-    uint64_t chunk     = s->cct->_conf->rgw_max_chunk_size;
-    uint64_t remaining = rdma_buf_len_ - rdma_buf_ofs_;
-    uint64_t to_copy   = std::min(chunk, remaining);
-    bl.append(reinterpret_cast<char*>(rdma_buf_) + rdma_buf_ofs_, to_copy);
-    rdma_buf_ofs_ += to_copy;
-    return static_cast<int>(to_copy);
+    // Parallel batch RDMA_READ: posts all 4 MiB WRs simultaneously, then
+    // polls for all completions.  Data lands in pre_buf_[0..rdma_buf_len_).
+    // Zero-copy: we reference pre_buf_ directly via buffer::create_static.
+    // Safe because DaosAtomicWriter::complete() waits for the async DAOS
+    // write before the next request can call rdma_read_batch().
+    using sc = std::chrono::steady_clock;
+    using ms = std::chrono::milliseconds;
+    auto t0 = sc::now();
+
+    auto& srv = RGWRdmaServer::instance();
+    RGW_US("before_rdma_read_batch");
+    int ret = srv.rdma_read_batch(rdma_saved_tok_, rdma_buf_len_);
+    RGW_US("after_rdma_read_batch");
+    if (ret < 0) {
+      ldpp_dout(this, 0) << "RGW RDMA: rdma_read_batch failed: " << ret << dendl;
+      return ret;
+    }
+
+    auto t1 = sc::now();
+    ldpp_dout(this, 0) << "TIMING rdma_read_batch(): total_len=" << rdma_buf_len_
+      << " rdma_total=" << std::chrono::duration_cast<ms>(t1 - t0).count() << "ms"
+      << dendl;
+
+    // Zero-copy: reference pre_buf_ data directly in the bufferlist.
+    bl.append(buffer::create_static(
+        rdma_buf_len_, reinterpret_cast<char*>(srv.put_buf())));
+    rdma_buf_ofs_ = rdma_buf_len_;
+    RGW_US("get_data_return_bl");
+    return static_cast<int>(rdma_buf_len_);
   }
 
   // Existing TCP path
@@ -2823,6 +2905,7 @@ void RGWPutObj_ObjStore_S3::send_response()
     if (copy_source.empty()) {
       dump_errno(s);
       dump_etag(s, etag);
+      if (rdma_active_) dump_header(s, "x-amz-rdma-reply", "true");
       dump_content_length(s, 0);
       dump_header_if_nonempty(s, "x-amz-version-id", version_id);
       dump_header_if_nonempty(s, "x-amz-expiration", expires);
@@ -2859,6 +2942,11 @@ void RGWPutObj_ObjStore_S3::send_response()
     dump_epoch_header(s, "Rgwx-Mtime", mtime);
   }
   end_header(s, this);
+}
+
+void RGWPutObj_ObjStore_S3::send_response_end()
+{
+  // No-op for PUT: chunked rdma_read is synchronous; no pending state to drain.
 }
 
 static inline void set_attr(map<string, bufferlist>& attrs, const char* key, const std::string& value)

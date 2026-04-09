@@ -16,6 +16,150 @@
  */
 
 #include "rgw_sal_daos.h"
+#include "rgw_us_trace.h"
+#include <memory>
+#include <daos_array.h>
+#include <functional>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
+#include <array>
+#include <atomic>
+// Minimal struct to access dfs_obj->oh without internal headers
+namespace {
+struct dfs_obj_min { void* dfs; daos_obj_id_t oid; daos_handle_t oh; };
+struct ds3_obj_min { void* dfs_obj; };
+static inline daos_handle_t get_array_oh(ds3_obj_t* obj) {
+    auto* s = reinterpret_cast<ds3_obj_min*>(obj);
+    auto* d = reinterpret_cast<dfs_obj_min*>(s->dfs_obj);
+    return d->oh;
+}
+} // anonymous namespace
+#include "rgw_rdma.h"
+
+// ============================================================================
+// Option 3: Dedicated DAOS progress thread + per-request condvar waiters.
+// One global daos_eq, ONE progress thread polls it; Beast workers submit
+// freely from any thread and wait on per-writer condition_variable. Mirrors
+// FIO's "one thread monopolizing one EQ" model so libdaos's per-EQ mutex
+// is never contended, while still allowing asio coroutine resumption on
+// arbitrary Beast worker threads (since the wait is a pthread condvar, not
+// a libdaos call).
+// ============================================================================
+namespace rgw::sal {
+struct DaosReqWaiter {
+    std::mutex              mtx;
+    std::condition_variable cv;
+    bool                    done = false;
+    int                     err  = 0;
+};
+}  // namespace rgw::sal
+
+namespace {
+static daos_handle_t        g_progress_eq = DAOS_HDL_INVAL;
+static std::thread          g_progress_thread;
+static std::atomic<bool>    g_progress_run{false};
+static std::once_flag       g_progress_once;
+
+// Completion callback fired by libdaos from inside the progress thread context.
+// Signals the per-writer condvar so the waiting Beast worker wakes up.
+static int
+daos_progress_completion_cb(void *arg, daos_event_t *ev, int ret) {
+    auto *w = static_cast<rgw::sal::DaosReqWaiter*>(arg);
+    {
+        std::lock_guard<std::mutex> lock(w->mtx);
+        w->done = true;
+        w->err  = ret;
+    }
+    w->cv.notify_one();
+    return 0;
+}
+
+static void
+daos_progress_loop() {
+    daos_event_t* completed[64];
+    while (g_progress_run.load(std::memory_order_relaxed)) {
+        // Poll with a short blocking timeout so we wake up quickly on new
+        // completions but also bail out cleanly when shutdown is requested.
+        // The blocking poll holds the per-EQ mutex during its wait, but
+        // since this is the ONLY thread that ever polls this EQ, contention
+        // is structurally impossible.
+        // Bounded blocking poll: wait up to 100 µs for completions before
+        // looping. Long enough to avoid 90% busy spin (NOWAIT), short enough
+        // that any completion that fires "between" wakeups is picked up
+        // within ~100 µs. DAOS_EQ_WAIT-only blocking missed bursts where
+        // libdaos's wakeup mechanism failed to fire, causing P99 wait
+        // tail to balloon.
+        int n = daos_eq_poll(g_progress_eq, 0, /*timeout_us*/100, 64, completed);
+        // n > 0: completion callbacks fired; nothing else to do.
+        // n == 0 / n < 0: spurious wakeup or error; loop again.
+        (void)n;
+    }
+}
+
+static void
+init_progress_thread() {
+    int rc = daos_eq_create(&g_progress_eq);
+    if (rc != 0) {
+        g_progress_eq = DAOS_HDL_INVAL;
+        return;
+    }
+    g_progress_run.store(true);
+    g_progress_thread = std::thread(daos_progress_loop);
+}
+
+static daos_handle_t
+get_progress_eq() {
+    std::call_once(g_progress_once, init_progress_thread);
+    return g_progress_eq;
+}
+
+// ============================================================================
+// libdfs-direct data path. When RGW_DFS_DIRECT=1, DaosAtomicWriter::process
+// and DaosObject::read bypass ds3_obj_write/read entirely and call
+// dfs_write/dfs_read directly on the cached dfs_t* (which libds3 already
+// created via dfs_connect). This mirrors FIO's DFS engine pattern: one
+// shared dfs_t* per process + per-request daos_event_t attached to the
+// existing singleton progress EQ.
+//
+// The key insight: ds3_obj_t is literally { dfs_obj_t *dfs_obj; } and
+// ds3_bucket_t is literally { dfs_t *dfs; } — libds3 is a thin wrapper
+// around libdfs. So instead of going through the racy ds3_obj_write +
+// ds3_obj_set_info path, we can call dfs_write directly with a per-request
+// event and skip the per-object metadata write entirely (which we don't
+// need for chunk-wise S3 RDMA where keys are content-addressed).
+// ============================================================================
+namespace {
+static inline bool dfs_direct_enabled() {
+    static const bool en = (std::getenv("RGW_DFS_DIRECT") != nullptr);
+    return en;
+}
+
+// Local mirrors of libds3 internal struct layout. These match
+// daos/src/client/ds3/ds3_internal.h exactly so we can peek the underlying
+// libdfs handles without going through the racy ds3_obj_* wrappers.
+// Layout is stable for the installed libds3 version 2.7.x.
+struct ds3_bucket_layout { dfs_t *dfs; };
+struct ds3_obj_layout    { dfs_obj_t *dfs_obj; };
+
+static inline dfs_t* dfs_of(ds3_bucket_t *b) {
+    return reinterpret_cast<ds3_bucket_layout*>(b)->dfs;
+}
+static inline dfs_obj_t* dfsobj_of(ds3_obj_t *o) {
+    return reinterpret_cast<ds3_obj_layout*>(o)->dfs_obj;
+}
+}  // namespace
+
+// Public entry point so DaosStore::initialize can eagerly start the
+// progress thread at RGW startup, avoiding a 589 ms stall on the first
+// concurrent request batch (lazy daos_eq_create() blocks all callers
+// of std::call_once until it returns).
+void
+ensure_progress_thread_started() {
+    std::call_once(g_progress_once, init_progress_thread);
+}
+}  // namespace
+
 
 #include <errno.h>
 #include <iomanip>
@@ -813,9 +957,35 @@ int DaosStore::initialize(CephContext* cct, const DoutPrefixProvider* dpp) {
   if (ret != 0) {
     ldout(cct, 0) << "ERROR: ds3_connect() failed: " << ret << dendl;
     ds3_fini();
+    return ret;
   }
 
+  // Eagerly create the progress-thread daos_eq so the first wave of
+  // concurrent S3 PUTs does not block ~589 ms inside std::call_once
+  // waiting for daos_eq_create on the request hot path.
+  ensure_progress_thread_started();
+  ldout(cct, 0) << "INFO: DAOS progress thread started" << dendl;
+
   return ret;
+}
+
+
+
+int DaosStore::get_or_open_bucket(const std::string& name, ds3_bucket_t** out_b) {
+    std::lock_guard<std::mutex> lock(ds3_bucket_cache_mtx);
+    auto it = ds3_bucket_cache.find(name);
+    if (it != ds3_bucket_cache.end()) {
+        *out_b = it->second;
+        return 0;
+    }
+    ds3_bucket_t* b = nullptr;
+    int rc = ds3_bucket_open(name.c_str(), &b, ds3, nullptr);
+    if (rc != 0) {
+        return rc;
+    }
+    ds3_bucket_cache[name] = b;
+    *out_b = b;
+    return 0;
 }
 
 const std::string& DaosZoneGroup::get_endpoint() const {
@@ -1203,19 +1373,37 @@ int DaosObject::DaosReadOp::iterate(const DoutPrefixProvider* dpp, int64_t off,
   // Calculate size, end is inclusive
   uint64_t size = end - off + 1;
 
-  // Reserve buffers and read
   bufferlist bl;
-  ret = source->read(dpp, bl, off, size);
-  if (ret != 0) {
-    return ret;
+  auto& rdma_srv = RGWRdmaServer::instance();
+  if (rdma_srv.is_ready()) {
+    // Zero-copy path: read DAOS data directly into RDMA pre_buf_.
+    // rdma_write_batch() will detect src==pre_buf_ and skip the memcpy.
+    char* buf = static_cast<char*>(rdma_srv.put_buf());
+    uint64_t full_size = static_cast<uint64_t>(off) + size;
+    uint64_t read_size = full_size;
+    ret = ds3_obj_read(buf, 0, &read_size,
+                       source->get_daos_bucket()->ds3b,
+                       source->ds3o, nullptr);
+    if (ret != 0) {
+      ldpp_dout(dpp, 0) << "ERROR: ds3_obj_read into pre_buf failed: " << ret << dendl;
+      return ret;
+    }
+    size = (read_size > static_cast<uint64_t>(off))
+           ? std::min(size, read_size - static_cast<uint64_t>(off)) : 0;
+    bl.push_back(buffer::create_static(size, buf + off));
+  } else {
+    // Normal path: DAOS allocates buffer internally.
+    ret = source->read(dpp, bl, off, size);
+    if (ret != 0) {
+      return ret;
+    }
   }
 
-  // Call cb to process returned data.
-  // Note: bl_ofs must be 0 because DaosObject::read() places data at position
-  // 0 of bl (not at offset `off`).
-  ldpp_dout(dpp, 20) << __func__ << ": call cb to process data, actual=" << size
-                     << dendl;
-  cb->handle_data(bl, 0, size);
+  // If RDMA server is connected, the data is already in pre_buf_ (we read
+  // directly into it above).  send_response_data→rdma_write_batch detects
+  // src==pre_buf_ and skips the 64 MiB memcpy — true zero-copy GET.
+  int cb_ret = cb->handle_data(bl, 0, size);
+  if (cb_ret < 0) return cb_ret;
   return ret;
 }
 
@@ -1437,8 +1625,27 @@ int DaosObject::read(const DoutPrefixProvider* dpp, bufferlist& data,
   uint64_t req_size = size;
   uint64_t full_size = offset + size;
   bufferlist full_bl;
-  int ret = ds3_obj_read(full_bl.append_hole(full_size).c_str(), 0, &full_size,
-                         get_daos_bucket()->ds3b, ds3o, nullptr);
+  int ret;
+  if (dfs_direct_enabled()) {
+    // FIO-style direct libdfs read. ds3_obj_t -> dfs_obj_t* unwrap.
+    // dfs_read does NOT have the offset bug; we pass the requested offset
+    // directly. But to match the existing semantics (read from 0 and slice),
+    // we still read full_size starting at 0 here. The dfs_direct path could
+    // be optimized to read just [offset, size) once we trust the offset.
+    d_iov_t iov;
+    d_iov_set(&iov, full_bl.append_hole(full_size).c_str(), full_size);
+    d_sg_list_t sgl{};
+    sgl.sg_nr = 1;
+    sgl.sg_iovs = &iov;
+    sgl.sg_nr_out = 1;
+    daos_size_t got = full_size;
+    ret = dfs_read(dfs_of(get_daos_bucket()->ds3b), dfsobj_of(ds3o),
+                   &sgl, /*off*/0, &got, nullptr);
+    full_size = got;
+  } else {
+    ret = ds3_obj_read(full_bl.append_hole(full_size).c_str(), 0, &full_size,
+                       get_daos_bucket()->ds3b, ds3o, nullptr);
+  }
   // Debug: log what ds3_obj_read returned and sample bytes at multiple positions
   {
     const unsigned char* p = (const unsigned char*)full_bl.c_str();
@@ -1617,16 +1824,15 @@ DaosAtomicWriter::DaosAtomicWriter(
       obj(_store, obj->get_key(), obj->get_bucket()) {}
 
 DaosAtomicWriter::~DaosAtomicWriter() {
-  if (write_submitted) {
-    bool flag = false;
-    daos_event_test(&write_ev, DAOS_EQ_WAIT, &flag);
+  if (write_submitted && waiter_) {
+    // Block on condvar until the progress thread fires our callback.
+    std::unique_lock<std::mutex> lock(waiter_->mtx);
+    waiter_->cv.wait(lock, [this]{ return waiter_->done; });
     daos_event_fini(&write_ev);
     write_submitted = false;
   }
-  if (writer_ds3b) {
-    ds3_bucket_close(writer_ds3b, nullptr);
-    writer_ds3b = nullptr;
-  }
+  // writer_ds3b is owned by DaosStore::ds3_bucket_cache; do not close.
+  writer_ds3b = nullptr;
 }
 
 int DaosAtomicWriter::prepare(optional_yield y) {
@@ -1638,13 +1844,18 @@ int DaosAtomicWriter::prepare(optional_yield y) {
   t_prepare_start = t0;
   first_process_seen = false;
 
-  // Open a private ds3b handle for this writer so that concurrent PUTs to the
-  // same bucket don't serialize on the shared DaosBucket::ds3b handle.
-  int ret = ds3_bucket_open(obj.get_bucket()->get_name().c_str(),
-                            &writer_ds3b, store->ds3, nullptr);
+  // Use the process-wide shared bucket-handle cache. The previous
+  // "private per-writer" approach forced every PUT to call ds3_bucket_open
+  // -> dfs_connect, which races inside libdfs when many threads connect
+  // concurrently and was causing intermittent EINVAL / HTTP 400. With the
+  // shared cached handle, libds3/libdfs only call dfs_connect once per
+  // bucket per RGW process; subsequent uses are read-only on the shared
+  // dfs_t* which is internally MT-safe for I/O operations.
+  int ret = store->get_or_open_bucket(obj.get_bucket()->get_name(),
+                                      &writer_ds3b);
   auto t1 = sc::now();
   if (ret != 0) {
-    ldpp_dout(dpp, 0) << "ERROR: prepare: ds3_bucket_open failed ret=" << ret
+    ldpp_dout(dpp, 0) << "ERROR: prepare: get_or_open_bucket failed ret=" << ret
                       << dendl;
     return ret;
   }
@@ -1656,7 +1867,7 @@ int DaosAtomicWriter::prepare(optional_yield y) {
     ldpp_dout(dpp, 0) << "ERROR: failed to create daos object ("
                       << obj.get_bucket()->get_name() << ", "
                       << obj.get_key().get_oid() << "): ret=" << ret << dendl;
-    ds3_bucket_close(writer_ds3b, nullptr);
+    // shared cached handle — do not close
     writer_ds3b = nullptr;
   }
 
@@ -1668,8 +1879,10 @@ int DaosAtomicWriter::prepare(optional_yield y) {
 }
 
 int DaosAtomicWriter::process(bufferlist&& data, uint64_t offset) {
+  RGW_US("DaosAtomicWriter_process_enter");
   ldpp_dout(dpp, 20) << "DEBUG: process" << dendl;
   if (data.length() == 0) {
+    RGW_US("DaosAtomicWriter_process_exit_empty");
     return 0;
   }
 
@@ -1691,12 +1904,14 @@ int DaosAtomicWriter::process(bufferlist&& data, uint64_t offset) {
 
   // If a previous async write is still in-flight (multi-chunk object), wait
   // for it to complete before submitting the next chunk.
-  if (write_submitted) {
-    bool flag = false;
-    daos_event_test(&write_ev, DAOS_EQ_WAIT, &flag);
-    int ev_ret = write_ev.ev_error;
+  if (write_submitted && waiter_) {
+    // Block on condvar; progress thread fires the callback in its own context.
+    std::unique_lock<std::mutex> lock(waiter_->mtx);
+    waiter_->cv.wait(lock, [this]{ return waiter_->done; });
+    int ev_ret = waiter_->err;
     daos_event_fini(&write_ev);
     write_submitted = false;
+    waiter_.reset();
     pending_data.clear();
     if (ev_ret != 0) {
       ldpp_dout(dpp, 0) << "ERROR: async write completed with error: "
@@ -1713,10 +1928,31 @@ int DaosAtomicWriter::process(bufferlist&& data, uint64_t offset) {
   // Submit the write asynchronously and return immediately.  Concurrent PUT
   // requests in other threads can now also submit their writes, giving DAOS
   // the same iodepth effect that fio achieves with --iodepth=N.
-  daos_event_init(&write_ev, DAOS_HDL_INVAL, nullptr);
+  waiter_ = std::make_unique<rgw::sal::DaosReqWaiter>();
+  daos_event_init(&write_ev, get_progress_eq(), nullptr);
+  daos_event_register_comp_cb(&write_ev, daos_progress_completion_cb,
+                              waiter_.get());
   uint64_t size = data_size;
-  int ret = ds3_obj_write(pending_data.c_str(), offset, &size,
-                          writer_ds3b, obj.ds3o, &write_ev);
+  RGW_US("before_ds3_obj_write_submit");
+  int ret;
+  if (dfs_direct_enabled()) {
+    // FIO-style direct libdfs submit. ds3_obj_t and ds3_bucket_t are thin
+    // wrappers — extract the underlying libdfs handles and call dfs_write
+    // directly with our event. This bypasses the racy ds3_obj_set_info
+    // path entirely and matches the exact code path FIO uses to reach
+    // 9.37 GB/s on this hardware.
+    d_iov_t iov;
+    d_iov_set(&iov, const_cast<char*>(pending_data.c_str()), data_size);
+    d_sg_list_t sgl{};
+    sgl.sg_nr = 1;
+    sgl.sg_iovs = &iov;
+    sgl.sg_nr_out = 1;
+    ret = dfs_write(dfs_of(writer_ds3b), dfsobj_of(obj.ds3o), &sgl, offset, &write_ev);
+  } else {
+    ret = ds3_obj_write(pending_data.c_str(), offset, &size,
+                        writer_ds3b, obj.ds3o, &write_ev);
+  }
+  RGW_US("after_ds3_obj_write_submit");
   if (ret != 0) {
     ldpp_dout(dpp, 0) << "ERROR: failed to submit async write ("
                       << obj.get_bucket()->get_name() << ", "
@@ -1726,6 +1962,7 @@ int DaosAtomicWriter::process(bufferlist&& data, uint64_t offset) {
   }
   write_submitted = true;
   total_data_size += data_size;
+  RGW_US("DaosAtomicWriter_process_exit");
   return 0;
 }
 
@@ -1735,6 +1972,7 @@ int DaosAtomicWriter::complete(
     ceph::real_time delete_at, const char* if_match, const char* if_nomatch,
     const std::string* user_data, rgw_zone_set* zones_trace, bool* canceled,
     optional_yield y, uint32_t flags) {
+  RGW_US("DaosAtomicWriter_complete_enter");
   ldpp_dout(dpp, 20) << "DEBUG: complete" << dendl;
   bufferlist bl;
   rgw_bucket_dir_entry ent;
@@ -1747,12 +1985,17 @@ int DaosAtomicWriter::complete(
   // Wait for the async data write submitted in process() to complete before
   // writing metadata.  All concurrent writers reach this point independently,
   // so their DAOS writes have been in-flight simultaneously.
-  if (write_submitted) {
-    bool flag = false;
-    daos_event_test(&write_ev, DAOS_EQ_WAIT, &flag);
-    ret = write_ev.ev_error;
+  if (write_submitted && waiter_) {
+    RGW_US("before_daos_event_test");
+    {
+      std::unique_lock<std::mutex> lock(waiter_->mtx);
+      waiter_->cv.wait(lock, [this]{ return waiter_->done; });
+      ret = waiter_->err;
+    }
+    RGW_US("after_daos_event_test");
     daos_event_fini(&write_ev);
     write_submitted = false;
+    waiter_.reset();
     pending_data.clear();
     if (ret != 0) {
       ldpp_dout(dpp, 0) << "ERROR: async data write failed: " << ret << dendl;
@@ -1799,7 +2042,14 @@ int DaosAtomicWriter::complete(
     }
   }
 
-  ret = obj.set_dir_entry_attrs(dpp, &ent, &attrs);
+  if (dfs_direct_enabled()) {
+    // Skip ds3_obj_set_info — for chunk-wise S3 RDMA the per-object metadata
+    // is not used (keys are content-addressed; LMCache reads the same key
+    // back) and ds3_obj_set_info races inside libds3 under concurrent PUTs.
+    ret = 0;
+  } else {
+    ret = obj.set_dir_entry_attrs(dpp, &ent, &attrs);
+  }
   auto t_after_meta = sc::now();
 
   if (is_versioned) {
@@ -1809,13 +2059,12 @@ int DaosAtomicWriter::complete(
     }
   }
 
-  // Release the private bucket handle now that all DAOS operations are done.
-  if (writer_ds3b) {
-    ds3_bucket_close(writer_ds3b, nullptr);
-    writer_ds3b = nullptr;
-  }
+  // writer_ds3b is owned by DaosStore::ds3_bucket_cache and shared across
+  // all writers; do NOT close it here. Just clear our local reference.
+  writer_ds3b = nullptr;
   auto t_end = sc::now();
 
+  RGW_US("DaosAtomicWriter_complete_exit");
   ldpp_dout(dpp, 0) << "TIMING pipeline(): "
     << "prepare_to_first_process=" << (first_process_seen ? std::to_string(std::chrono::duration_cast<ms>(t_first_process - t_prepare_start).count()) : "N/A") << "ms "
     << "body_reception=" << (first_process_seen ? std::to_string(std::chrono::duration_cast<ms>(t_last_process - t_first_process).count()) : "N/A") << "ms "
@@ -2753,11 +3002,286 @@ std::string DaosStore::get_cluster_id(const DoutPrefixProvider* dpp,
   return "";
 }
 
+
+
+namespace {
+
+// Persistent helper-thread pool for parallel daos_array_read fan-out in
+// kvcache_stream_daos. Created once at first use and lives the lifetime of
+// the RGW process. Each of the kPoolSize worker threads has its own
+// per-thread libdaos scheduler context the first time it touches the API,
+// so each worker maps to one independent FIO-style job (numjobs=N
+// iodepth=1).
+class DaosReadPool {
+ public:
+  static constexpr size_t kPoolSize = 16;
+
+  static DaosReadPool& instance() {
+    static DaosReadPool pool;
+    return pool;
+  }
+
+  // Submit one job to slot `slot`. Caller must wait on `done` to know when
+  // the job has completed.
+  struct Job {
+    std::function<void()> fn;
+    std::atomic<bool>     done{false};
+  };
+
+  // Run a batch of N jobs (one per slot, slots [0..N)) in parallel and wait
+  // for all of them to finish before returning. N must be <= kPoolSize.
+  void run_batch(size_t n, std::function<void(size_t)> body) {
+    if (n == 0) return;
+    if (n > kPoolSize) n = kPoolSize;
+
+    std::vector<Job> jobs(n);
+    for (size_t i = 0; i < n; i++) {
+      Job& j = jobs[i];
+      j.fn = [&body, i, &j]() {
+        body(i);
+        j.done.store(true, std::memory_order_release);
+      };
+    }
+
+    // Push the jobs to slots and wake them up.
+    for (size_t i = 0; i < n; i++) {
+      Slot& s = slots_[i];
+      {
+        std::unique_lock<std::mutex> lk(s.m);
+        s.job = &jobs[i];
+      }
+      s.cv.notify_one();
+    }
+
+    // Spin-wait for completion (cheap polling on per-job done flag).
+    for (size_t i = 0; i < n; i++) {
+      while (!jobs[i].done.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+      }
+    }
+  }
+
+ private:
+  struct Slot {
+    std::mutex              m;
+    std::condition_variable cv;
+    Job*                    job{nullptr};
+    bool                    stop{false};
+  };
+
+  std::array<Slot, kPoolSize> slots_;
+  std::array<std::thread, kPoolSize> workers_;
+
+  DaosReadPool() {
+    for (size_t i = 0; i < kPoolSize; i++) {
+      workers_[i] = std::thread(&DaosReadPool::worker_loop, this, i);
+    }
+  }
+
+  ~DaosReadPool() {
+    for (size_t i = 0; i < kPoolSize; i++) {
+      Slot& s = slots_[i];
+      {
+        std::lock_guard<std::mutex> lk(s.m);
+        s.stop = true;
+      }
+      s.cv.notify_one();
+    }
+    for (auto& t : workers_) if (t.joinable()) t.join();
+  }
+
+  void worker_loop(size_t slot_id) {
+    Slot& s = slots_[slot_id];
+    while (true) {
+      Job* j = nullptr;
+      {
+        std::unique_lock<std::mutex> lk(s.m);
+        s.cv.wait(lk, [&] { return s.job != nullptr || s.stop; });
+        if (s.stop) return;
+        j = s.job;
+        s.job = nullptr;
+      }
+      j->fn();
+    }
+  }
+
+  DaosReadPool(const DaosReadPool&) = delete;
+  DaosReadPool& operator=(const DaosReadPool&) = delete;
+};
+
+}  // namespace
+
+int kvcache_stream_daos(
+    void* bucket_ptr,
+    const NixlRdmaToken& rdma_tok,
+    const std::vector<std::string>& chunk_keys,
+    int num_layers,
+    size_t kv_per_token_per_layer,
+    size_t tokens_per_chunk,
+    int layer_aggregate,
+    const DoutPrefixProvider* dpp)
+{
+  auto& rdma_srv = RGWRdmaServer::instance();
+  if (!rdma_srv.is_ready()) {
+    ldpp_dout(dpp, 0) << "kvcache_stream_daos: RDMA server not ready" << dendl;
+    return -EIO;
+  }
+
+  auto* daos_bucket = static_cast<DaosBucket*>(bucket_ptr);
+  if (!daos_bucket || !daos_bucket->ds3b) {
+    ldpp_dout(dpp, 0) << "kvcache_stream_daos: DAOS bucket not available" << dendl;
+    return -EIO;
+  }
+
+  const size_t N = chunk_keys.size();
+  const size_t layer_slice = kv_per_token_per_layer * tokens_per_chunk;
+  const size_t layer_total = layer_slice * N;
+
+  ldpp_dout(dpp, 0) << "kvcache_stream_daos: N=" << N << " layers=" << num_layers
+    << " layer_slice=" << layer_slice << " layer_total=" << layer_total << dendl;
+
+  if (layer_total > RGWRdmaServer::kPutBufSz) {
+    ldpp_dout(dpp, 0) << "kvcache_stream_daos: layer_total too large for pre_buf_" << dendl;
+    return -EINVAL;
+  }
+
+  // Pre-open all chunk objects (avoid open/close per layer)
+  std::vector<ds3_obj_t*> chunk_objs(N, nullptr);
+  for (size_t ci = 0; ci < N; ci++) {
+    // Apply RGW OID transformation: prepend extra _ if name starts with _
+    std::string oid = chunk_keys[ci];
+    if (!oid.empty() && oid[0] == '_') oid = std::string("_") + oid;
+    int ret = ds3_obj_open(oid.c_str(), &chunk_objs[ci], daos_bucket->ds3b);
+    if (ret != 0) {
+      ldpp_dout(dpp, 0) << "kvcache_stream_daos: ds3_obj_open failed chunk="
+        << chunk_keys[ci] << " ret=" << ret << dendl;
+      // Close any already-opened objects
+      for (size_t j = 0; j < ci; j++) ds3_obj_close(chunk_objs[j]);
+      return ret;
+    }
+  }
+
+  using sc = std::chrono::steady_clock;
+  using ms = std::chrono::milliseconds;
+  auto t_start = sc::now();
+
+  // Stream layer by layer: read layer slice directly from each chunk via offset,
+  // assemble into pre_buf_, RDMA_WRITE to client.
+  char* assembly = static_cast<char*>(rdma_srv.put_buf());
+
+  // Clamp layer_aggregate to valid range
+  if (layer_aggregate <= 0 || layer_aggregate > num_layers)
+    layer_aggregate = num_layers;
+
+  const size_t agg_slice = layer_slice * layer_aggregate;  // bytes per chunk per aggregate group
+  const size_t agg_total = agg_slice * N;                  // bytes per RDMA push
+
+  ldpp_dout(dpp, 0) << "kvcache_stream_daos: layer_aggregate=" << layer_aggregate
+    << " agg_slice=" << agg_slice << " agg_total=" << agg_total << dendl;
+
+  if (agg_total > RGWRdmaServer::kPutBufSz) {
+    ldpp_dout(dpp, 0) << "kvcache_stream_daos: agg_total too large for pre_buf_" << dendl;
+    for (size_t j = 0; j < N; j++) ds3_obj_close(chunk_objs[j]);
+    return -EINVAL;
+  }
+
+  // INTERLEAVED LAYER-MAJOR: read one layer slice (1 MB matching the DFS cell
+  // size) from each chunk, then immediately RDMA-push that layer. The client GPU
+  // can start prefill on layer 0 as soon as the first layer arrives, instead of
+  // waiting ~578 ms for all chunks to be fully read.
+  //
+  // Why this beats the chunk-major version (read all chunks fully, then deliver):
+  //   - Each daos_array_read is exactly layer_slice bytes (1 MB on 8B model),
+  //     matching DFS_DEFAULT_CHUNK_SIZE so it is one internal cell read instead
+  //     of fanning out into 32 sequential cells inside DAOS.
+  //   - Client GPU sees layer 0 at t ≈ N × per_cell_latency, not t ≈ total_size /
+  //     bandwidth. With prefill overlap (LMCache layerwise pipelining) the
+  //     end-to-end TTFT becomes max(read, compute) instead of read + compute.
+  size_t per_layer_total_bytes = layer_slice * N;  // bytes per single layer push
+  size_t total_layers_read_ms = 0;  // accumulated for the SG read log line
+
+  // Buffers for one aggregate group: layer_aggregate layers × N chunks × layer_slice
+  // (assembly[] is the pre-registered RDMA pre_buf_)
+  for (int group_start = 0; group_start < num_layers; group_start += layer_aggregate) {
+    int group_end = std::min(group_start + layer_aggregate, num_layers);
+    int group_size = group_end - group_start;
+    size_t group_bytes_per_chunk = static_cast<size_t>(group_size) * layer_slice;
+    size_t group_total = group_bytes_per_chunk * N;
+
+    auto t_read_start = sc::now();
+
+    // PARALLEL DAOS READS via persistent thread pool (Shape 2).
+    //
+    // We dispatch N parallel daos_array_read calls onto a per-process pool of
+    // kPoolSize=16 long-lived worker threads (created once at first use and
+    // reused for the lifetime of the RGW process). Each worker runs the DAOS
+    // call synchronously, so it gets its own thread-private libdaos scheduler
+    // context — same model as FIO numjobs=N iodepth=1 — but without the
+    // per-layer pthread_create/join overhead Shape 1 paid.
+    std::vector<int> per_chunk_ret(N, 0);
+
+    DaosReadPool::instance().run_batch(N, [&](size_t ci) {
+      daos_range_t rg;
+      rg.rg_idx = static_cast<uint64_t>(group_start) * layer_slice;
+      rg.rg_len = group_bytes_per_chunk;
+
+      daos_array_iod_t iod{};
+      iod.arr_nr = 1;
+      iod.arr_rgs = &rg;
+
+      d_iov_t iov;
+      d_iov_set(&iov, assembly + ci * group_bytes_per_chunk, group_bytes_per_chunk);
+      d_sg_list_t sgl{};
+      sgl.sg_nr = 1;
+      sgl.sg_iovs = &iov;
+      sgl.sg_nr_out = 1;
+
+      per_chunk_ret[ci] = daos_array_read(get_array_oh(chunk_objs[ci]),
+                                          DAOS_TX_NONE, &iod, &sgl, nullptr);
+    });
+
+    // Check if any helper failed.
+    for (size_t ci = 0; ci < N; ci++) {
+      if (per_chunk_ret[ci] != 0) {
+        ldpp_dout(dpp, 0) << "kvcache_stream_daos: daos_array_read failed chunk="
+          << ci << " group=" << group_start << " ret=" << per_chunk_ret[ci] << dendl;
+        for (size_t j = 0; j < N; j++) ds3_obj_close(chunk_objs[j]);
+        return -per_chunk_ret[ci];
+      }
+    }
+
+    auto t_read_end = sc::now();
+    total_layers_read_ms += std::chrono::duration_cast<ms>(t_read_end - t_read_start).count();
+
+    NixlRdmaToken group_tok = rdma_tok;
+    group_tok.addr += static_cast<uint64_t>(group_start) * per_layer_total_bytes;
+
+    int ret = rdma_srv.rdma_write_batch(group_tok, assembly, group_total);
+    if (ret < 0) {
+      ldpp_dout(dpp, 0) << "kvcache_stream_daos: rdma_write_batch failed group="
+        << group_start << " ret=" << ret << dendl;
+      for (size_t j = 0; j < N; j++) ds3_obj_close(chunk_objs[j]);
+      return ret;
+    }
+  }
+
+  auto t_done = sc::now();
+
+  // Close all chunk objects
+  for (size_t ci = 0; ci < N; ci++) ds3_obj_close(chunk_objs[ci]);
+
+  ldpp_dout(dpp, 0) << "kvcache_stream_daos: complete (LAYER-MAJOR Shape2 thread-pool). "
+    << N << " chunks x " << num_layers << " layers in "
+    << std::chrono::duration_cast<ms>(t_done - t_start).count() << "ms "
+    << "(daos_read_total=" << total_layers_read_ms << "ms layer_slice="
+    << layer_slice << " agg=" << layer_aggregate << ")" << dendl;
+
+  return 0;
+}
+
 }  // namespace rgw::sal
 
-extern "C" {
 
-void* newDaosStore(CephContext* cct) {
+extern "C" void* newDaosStore(CephContext* cct) {
   return new rgw::sal::DaosStore(cct);
-}
 }
