@@ -1454,30 +1454,18 @@ int DaosObject::DaosReadOp::iterate(const DoutPrefixProvider* dpp, int64_t off,
   // Calculate size, end is inclusive
   uint64_t size = end - off + 1;
 
+  // Always use the async source->read() (heap bufferlist). The previous
+  // "read directly into pre_buf_" RDMA fast path was unsafe under
+  // concurrent reads (all threads writing into the same shared buffer).
+  // The cb->handle_data -> rdma_write_batch path memcpys from the heap
+  // bufferlist into pre_buf_ under rdma_mutex_, which is the same
+  // serialization point that already exists for the RDMA write back
+  // to the client. Net effect: parallel libdaos reads via the EQ pool,
+  // serialized RDMA writes (rdma_mutex_ remains the next bottleneck).
   bufferlist bl;
-  auto& rdma_srv = RGWRdmaServer::instance();
-  if (rdma_srv.is_ready()) {
-    // Zero-copy path: read DAOS data directly into RDMA pre_buf_.
-    // rdma_write_batch() will detect src==pre_buf_ and skip the memcpy.
-    char* buf = static_cast<char*>(rdma_srv.put_buf());
-    uint64_t full_size = static_cast<uint64_t>(off) + size;
-    uint64_t read_size = full_size;
-    ret = ds3_obj_read(buf, 0, &read_size,
-                       source->get_daos_bucket()->ds3b,
-                       source->ds3o, nullptr);
-    if (ret != 0) {
-      ldpp_dout(dpp, 0) << "ERROR: ds3_obj_read into pre_buf failed: " << ret << dendl;
-      return ret;
-    }
-    size = (read_size > static_cast<uint64_t>(off))
-           ? std::min(size, read_size - static_cast<uint64_t>(off)) : 0;
-    bl.push_back(buffer::create_static(size, buf + off));
-  } else {
-    // Normal path: DAOS allocates buffer internally.
-    ret = source->read(dpp, bl, off, size);
-    if (ret != 0) {
-      return ret;
-    }
+  ret = source->read(dpp, bl, off, size);
+  if (ret != 0) {
+    return ret;
   }
 
   // If RDMA server is connected, the data is already in pre_buf_ (we read
@@ -1702,31 +1690,55 @@ int DaosObject::read(const DoutPrefixProvider* dpp, bufferlist& data,
 
   // Workaround for libdaos 2.7.x bug: ds3_obj_read at non-zero offset
   // ignores the offset and returns data from the start of the object.
-  // Always read from offset 0 and extract the requested subrange.
+  // We read from offset 0 and slice in the bufferlist below.
   uint64_t req_size = size;
   uint64_t full_size = offset + size;
   bufferlist full_bl;
-  int ret;
-  if (dfs_direct_enabled()) {
-    // FIO-style direct libdfs read. ds3_obj_t -> dfs_obj_t* unwrap.
-    // dfs_read does NOT have the offset bug; we pass the requested offset
-    // directly. But to match the existing semantics (read from 0 and slice),
-    // we still read full_size starting at 0 here. The dfs_direct path could
-    // be optimized to read just [offset, size) once we trust the offset.
-    d_iov_t iov;
-    d_iov_set(&iov, full_bl.append_hole(full_size).c_str(), full_size);
-    d_sg_list_t sgl{};
-    sgl.sg_nr = 1;
-    sgl.sg_iovs = &iov;
-    sgl.sg_nr_out = 1;
-    daos_size_t got = full_size;
-    ret = dfs_read(dfs_of(get_daos_bucket()->ds3b), dfsobj_of(ds3o),
-                   &sgl, /*off*/0, &got, nullptr);
-    full_size = got;
-  } else {
-    ret = ds3_obj_read(full_bl.append_hole(full_size).c_str(), 0, &full_size,
-                       get_daos_bucket()->ds3b, ds3o, nullptr);
+
+  // === Async read via the daos_eq pool ===
+  // Mirror of DaosAtomicWriter::process: allocate a daos_event_t bound
+  // to a pooled EQ via get_progress_eq() (round-robin), submit dfs_read
+  // asynchronously, register a condvar-based completion callback so the
+  // dedicated progress thread for that EQ wakes us up when the read
+  // returns. This breaks libdaos\u2019s per-client-context serialization on
+  // synchronous reads and lets multiple beast workers have outstanding
+  // dfs_read RPCs in flight at the same time.
+  daos_event_t read_ev = {};
+  auto waiter = std::make_unique<rgw::sal::DaosReqWaiter>();
+  daos_event_init(&read_ev, get_progress_eq(), nullptr);
+  daos_event_register_comp_cb(&read_ev, daos_progress_completion_cb,
+                              waiter.get());
+
+  d_iov_t iov;
+  d_iov_set(&iov, full_bl.append_hole(full_size).c_str(), full_size);
+  d_sg_list_t sgl{};
+  sgl.sg_nr = 1;
+  sgl.sg_iovs = &iov;
+  sgl.sg_nr_out = 1;
+  daos_size_t got = full_size;
+  int ret = dfs_read(dfs_of(get_daos_bucket()->ds3b), dfsobj_of(ds3o),
+                     &sgl, /*off*/0, &got, &read_ev);
+  if (ret != 0) {
+    daos_event_fini(&read_ev);
+    ldpp_dout(dpp, 0) << "ERROR: dfs_read submit failed: " << ret << dendl;
+    size = 0;
+    return ret;
   }
+
+  // Wait for the read to complete (progress thread fires the callback).
+  {
+    std::unique_lock<std::mutex> lock(waiter->mtx);
+    waiter->cv.wait(lock, [&]{ return waiter->done; });
+  }
+  int err = waiter->err;
+  daos_event_fini(&read_ev);
+  if (err != 0) {
+    ldpp_dout(dpp, 0) << "ERROR: async dfs_read completed with error: "
+                      << err << dendl;
+    size = 0;
+    return -err;
+  }
+  full_size = got;
   // Debug: log what ds3_obj_read returned and sample bytes at multiple positions
   {
     const unsigned char* p = (const unsigned char*)full_bl.c_str();
