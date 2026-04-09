@@ -58,10 +58,15 @@ struct DaosReqWaiter {
 }  // namespace rgw::sal
 
 namespace {
-static daos_handle_t        g_progress_eq = DAOS_HDL_INVAL;
-static std::thread          g_progress_thread;
+// Option C: pool of N daos_eq each with its own dedicated progress thread.
+// Pool size is read once at first use from NIXL_DAOS_EQ_POOL (default 8).
+static constexpr size_t MAX_DAOS_EQ_POOL = 64;
+static daos_handle_t        g_progress_eq_pool[MAX_DAOS_EQ_POOL] = {};
+static std::thread          g_progress_threads[MAX_DAOS_EQ_POOL];
+static size_t               g_progress_eq_pool_size = 0;
 static std::atomic<bool>    g_progress_run{false};
 static std::once_flag       g_progress_once;
+static std::atomic<uint64_t> g_progress_rr_counter{0};
 
 // Completion callback fired by libdaos from inside the progress thread context.
 // Signals the per-writer condvar so the waiting Beast worker wakes up.
@@ -77,43 +82,47 @@ daos_progress_completion_cb(void *arg, daos_event_t *ev, int ret) {
     return 0;
 }
 
+// Per-EQ progress loop: each thread polls only its own EQ index, so
+// libdaos's per-EQ mutex is uncontended (one polling thread per EQ).
 static void
-daos_progress_loop() {
+daos_progress_loop_one(size_t idx) {
     daos_event_t* completed[64];
+    daos_handle_t eq = g_progress_eq_pool[idx];
     while (g_progress_run.load(std::memory_order_relaxed)) {
-        // Poll with a short blocking timeout so we wake up quickly on new
-        // completions but also bail out cleanly when shutdown is requested.
-        // The blocking poll holds the per-EQ mutex during its wait, but
-        // since this is the ONLY thread that ever polls this EQ, contention
-        // is structurally impossible.
-        // Bounded blocking poll: wait up to 100 µs for completions before
-        // looping. Long enough to avoid 90% busy spin (NOWAIT), short enough
-        // that any completion that fires "between" wakeups is picked up
-        // within ~100 µs. DAOS_EQ_WAIT-only blocking missed bursts where
-        // libdaos's wakeup mechanism failed to fire, causing P99 wait
-        // tail to balloon.
-        int n = daos_eq_poll(g_progress_eq, 0, /*timeout_us*/100, 64, completed);
-        // n > 0: completion callbacks fired; nothing else to do.
-        // n == 0 / n < 0: spurious wakeup or error; loop again.
+        int n = daos_eq_poll(eq, 0, /*timeout_us*/100, 64, completed);
         (void)n;
     }
 }
 
 static void
 init_progress_thread() {
-    int rc = daos_eq_create(&g_progress_eq);
-    if (rc != 0) {
-        g_progress_eq = DAOS_HDL_INVAL;
-        return;
+    const char *e = std::getenv("NIXL_DAOS_EQ_POOL");
+    size_t n = e ? static_cast<size_t>(std::atoi(e)) : 8u;
+    if (n < 1) n = 1;
+    if (n > MAX_DAOS_EQ_POOL) n = MAX_DAOS_EQ_POOL;
+    g_progress_eq_pool_size = n;
+    for (size_t i = 0; i < n; ++i) {
+        int rc = daos_eq_create(&g_progress_eq_pool[i]);
+        if (rc != 0) {
+            g_progress_eq_pool[i] = DAOS_HDL_INVAL;
+        }
     }
     g_progress_run.store(true);
-    g_progress_thread = std::thread(daos_progress_loop);
+    for (size_t i = 0; i < n; ++i) {
+        if (g_progress_eq_pool[i].cookie != 0) {
+            g_progress_threads[i] = std::thread(daos_progress_loop_one, i);
+        }
+    }
 }
 
+// Round-robin assignment: each call returns the next EQ from the pool.
 static daos_handle_t
 get_progress_eq() {
     std::call_once(g_progress_once, init_progress_thread);
-    return g_progress_eq;
+    if (g_progress_eq_pool_size == 0) return DAOS_HDL_INVAL;
+    uint64_t i = g_progress_rr_counter.fetch_add(1, std::memory_order_relaxed)
+                 % g_progress_eq_pool_size;
+    return g_progress_eq_pool[i];
 }
 
 // ============================================================================
