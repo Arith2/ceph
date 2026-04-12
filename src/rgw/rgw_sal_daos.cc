@@ -1988,6 +1988,7 @@ int DaosAtomicWriter::prepare(optional_yield y) {
   ret = ds3_obj_create(obj.get_key().get_oid().c_str(), &obj.ds3o, writer_ds3b);
   RGW_US("after_ds3_obj_create");
   auto t2 = sc::now();
+
   if (ret != 0) {
     ldpp_dout(dpp, 0) << "ERROR: failed to create daos object ("
                       << obj.get_bucket()->get_name() << ", "
@@ -3311,7 +3312,7 @@ int kvcache_stream_daos(
 
   // Per-layer-per-chunk storage: objects are opened inside the layer
   // loop, not pre-opened here. Each per-layer object key is derived as
-  // chunk_keys[ci] + "_L" + to_string(layer_idx). This matches the
+  // chunk_keys[ci] + "_l" + zero-padded layer_idx. This matches the
   // production LMCache layout where each S3 object stores one layer of
   // one chunk (e.g., 1 MiB for Llama 8B, 64 KiB for Llama 70B).
   auto* ds3b = daos_bucket->ds3b;
@@ -3375,7 +3376,7 @@ int kvcache_stream_daos(
     std::vector<int> per_chunk_ret(N, 0);
 
     // Per-layer-per-chunk: open N per-layer objects, read each fully,
-    // close after read. Key convention: chunk_key + "_L" + layer_idx.
+    // close after read. Key convention: chunk_key + "_l" + zero-padded layer_idx.
     // For agg>1 groups, we read consecutive layers from the same chunk
     // and concatenate into the assembly buffer.
     DaosReadPool::instance().run_batch(N, [&](size_t ci) {
@@ -3383,7 +3384,11 @@ int kvcache_stream_daos(
       for (int li = 0; li < group_size && per_chunk_ret[ci] == 0; li++) {
         int layer_idx = group_start + li;
         // Derive per-layer key: chunk_base + "_L" + layer_index
-        std::string layer_key = chunk_keys[ci] + "_L" + std::to_string(layer_idx);
+        // Key convention: base_key + "_l" + zero-padded layer index
+        // Matches: prepop_{size}B_i{iter}_c{chunk}_l{layer}
+        char lbuf[16];
+        std::snprintf(lbuf, sizeof(lbuf), "_l%04d", layer_idx);
+        std::string layer_key = chunk_keys[ci] + lbuf;
         // Apply RGW OID transformation
         if (!layer_key.empty() && layer_key[0] == '_')
           layer_key = std::string("_") + layer_key;
