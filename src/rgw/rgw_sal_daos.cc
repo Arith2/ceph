@@ -3309,21 +3309,12 @@ int kvcache_stream_daos(
     return -EINVAL;
   }
 
-  // Pre-open all chunk objects (avoid open/close per layer)
-  std::vector<ds3_obj_t*> chunk_objs(N, nullptr);
-  for (size_t ci = 0; ci < N; ci++) {
-    // Apply RGW OID transformation: prepend extra _ if name starts with _
-    std::string oid = chunk_keys[ci];
-    if (!oid.empty() && oid[0] == '_') oid = std::string("_") + oid;
-    int ret = ds3_obj_open(oid.c_str(), &chunk_objs[ci], daos_bucket->ds3b);
-    if (ret != 0) {
-      ldpp_dout(dpp, 0) << "kvcache_stream_daos: ds3_obj_open failed chunk="
-        << chunk_keys[ci] << " ret=" << ret << dendl;
-      // Close any already-opened objects
-      for (size_t j = 0; j < ci; j++) ds3_obj_close(chunk_objs[j]);
-      return ret;
-    }
-  }
+  // Per-layer-per-chunk storage: objects are opened inside the layer
+  // loop, not pre-opened here. Each per-layer object key is derived as
+  // chunk_keys[ci] + "_L" + to_string(layer_idx). This matches the
+  // production LMCache layout where each S3 object stores one layer of
+  // one chunk (e.g., 1 MiB for Llama 8B, 64 KiB for Llama 70B).
+  auto* ds3b = daos_bucket->ds3b;
 
   using sc = std::chrono::steady_clock;
   using ms = std::chrono::milliseconds;
@@ -3345,7 +3336,6 @@ int kvcache_stream_daos(
 
   if (agg_total > RGWRdmaServer::kPutBufSz) {
     ldpp_dout(dpp, 0) << "kvcache_stream_daos: agg_total too large for pre_buf_" << dendl;
-    for (size_t j = 0; j < N; j++) ds3_obj_close(chunk_objs[j]);
     return -EINVAL;
   }
 
@@ -3384,24 +3374,47 @@ int kvcache_stream_daos(
     // per-layer pthread_create/join overhead Shape 1 paid.
     std::vector<int> per_chunk_ret(N, 0);
 
+    // Per-layer-per-chunk: open N per-layer objects, read each fully,
+    // close after read. Key convention: chunk_key + "_L" + layer_idx.
+    // For agg>1 groups, we read consecutive layers from the same chunk
+    // and concatenate into the assembly buffer.
     DaosReadPool::instance().run_batch(N, [&](size_t ci) {
-      daos_range_t rg;
-      rg.rg_idx = static_cast<uint64_t>(group_start) * layer_slice;
-      rg.rg_len = group_bytes_per_chunk;
+      per_chunk_ret[ci] = 0;
+      for (int li = 0; li < group_size && per_chunk_ret[ci] == 0; li++) {
+        int layer_idx = group_start + li;
+        // Derive per-layer key: chunk_base + "_L" + layer_index
+        std::string layer_key = chunk_keys[ci] + "_L" + std::to_string(layer_idx);
+        // Apply RGW OID transformation
+        if (!layer_key.empty() && layer_key[0] == '_')
+          layer_key = std::string("_") + layer_key;
 
-      daos_array_iod_t iod{};
-      iod.arr_nr = 1;
-      iod.arr_rgs = &rg;
+        ds3_obj_t *layer_obj = nullptr;
+        int rc = ds3_obj_open(layer_key.c_str(), &layer_obj, ds3b);
+        if (rc != 0) { per_chunk_ret[ci] = rc; break; }
 
-      d_iov_t iov;
-      d_iov_set(&iov, assembly + ci * group_bytes_per_chunk, group_bytes_per_chunk);
-      d_sg_list_t sgl{};
-      sgl.sg_nr = 1;
-      sgl.sg_iovs = &iov;
-      sgl.sg_nr_out = 1;
+        // Read full object (offset=0, len=layer_slice)
+        daos_range_t rg;
+        rg.rg_idx = 0;
+        rg.rg_len = layer_slice;
 
-      per_chunk_ret[ci] = daos_array_read(get_array_oh(chunk_objs[ci]),
-                                          DAOS_TX_NONE, &iod, &sgl, nullptr);
+        daos_array_iod_t iod{};
+        iod.arr_nr = 1;
+        iod.arr_rgs = &rg;
+
+        // Place layer li of chunk ci at the right offset in assembly
+        d_iov_t iov;
+        d_iov_set(&iov, assembly + ci * group_bytes_per_chunk + li * layer_slice,
+                   layer_slice);
+        d_sg_list_t sgl{};
+        sgl.sg_nr = 1;
+        sgl.sg_iovs = &iov;
+        sgl.sg_nr_out = 1;
+
+        rc = daos_array_read(get_array_oh(layer_obj),
+                             DAOS_TX_NONE, &iod, &sgl, nullptr);
+        ds3_obj_close(layer_obj);
+        if (rc != 0) per_chunk_ret[ci] = rc;
+      }
     });
 
     // Check if any helper failed.
@@ -3409,7 +3422,6 @@ int kvcache_stream_daos(
       if (per_chunk_ret[ci] != 0) {
         ldpp_dout(dpp, 0) << "kvcache_stream_daos: daos_array_read failed chunk="
           << ci << " group=" << group_start << " ret=" << per_chunk_ret[ci] << dendl;
-        for (size_t j = 0; j < N; j++) ds3_obj_close(chunk_objs[j]);
         return -per_chunk_ret[ci];
       }
     }
@@ -3424,15 +3436,13 @@ int kvcache_stream_daos(
     if (ret < 0) {
       ldpp_dout(dpp, 0) << "kvcache_stream_daos: rdma_write_batch failed group="
         << group_start << " ret=" << ret << dendl;
-      for (size_t j = 0; j < N; j++) ds3_obj_close(chunk_objs[j]);
       return ret;
     }
   }
 
   auto t_done = sc::now();
 
-  // Close all chunk objects
-  for (size_t ci = 0; ci < N; ci++) ds3_obj_close(chunk_objs[ci]);
+  // Per-layer objects are opened and closed inside the layer loop.
 
   ldpp_dout(dpp, 0) << "kvcache_stream_daos: complete (LAYER-MAJOR Shape2 thread-pool). "
     << N << " chunks x " << num_layers << " layers in "
