@@ -310,9 +310,9 @@ int RGWGetObj_ObjStore_S3::get_params(optional_yield y)
 
   dst_zone_trace = s->info.args.get(RGW_SYS_PARAM_PREFIX "if-not-replicated-to");
 
-  // Check for RDMA token: NIXL GET RDMA path sends x-amz-rdma-token with its
+  // Check for RDMA token: NIXL GET RDMA path sends x-amz-rdma-buffer with its
   // receive buffer registration so RGW can RDMA_WRITE data directly to NIXL.
-  const char* rdma_hdr = s->info.env->get("HTTP_X_AMZ_RDMA_TOKEN");
+  const char* rdma_hdr = s->info.env->get("HTTP_X_AMZ_RDMA_BUFFER");
   if (rdma_hdr && RGWRdmaServer::parse_token(rdma_hdr, rdma_get_tok_)) {
     rdma_get_active_ = true;
   }
@@ -2795,7 +2795,7 @@ int RGWPutObj_ObjStore_S3::get_params(optional_yield y)
 int RGWPutObj_ObjStore_S3::get_data(bufferlist& bl)
 {
   // Check for RDMA token header (set by NIXL when decoupled data plane is active)
-  const char* rdma_hdr = s->info.env->get("HTTP_X_AMZ_RDMA_TOKEN");
+  const char* rdma_hdr = s->info.env->get("HTTP_X_AMZ_RDMA_BUFFER");
   if (rdma_hdr) {
     // Stamp this RGW worker thread with the NIXL request id so all
     // RGW_US probes on this thread carry it (cleared at function exit).
@@ -2813,7 +2813,7 @@ int RGWPutObj_ObjStore_S3::get_data(bufferlist& bl)
       // First call: parse token, allocate 4 MiB staging buffer, skip MD5.
       NixlRdmaToken tok{};
       if (!RGWRdmaServer::parse_token(rdma_hdr, tok)) {
-        ldpp_dout(this, 0) << "RGW RDMA: failed to parse x-amz-rdma-token" << dendl;
+        ldpp_dout(this, 0) << "RGW RDMA: failed to parse x-amz-rdma-buffer" << dendl;
         RGW_US_CLR(); return -EINVAL;
       }
       if (!RGWRdmaServer::instance().is_ready()) {

@@ -45,7 +45,7 @@ protected:
   int custom_http_ret = 0;
   std::map<std::string, std::string> crypt_http_responses;
   int override_range_hdr(const rgw::auth::StrategyRegistry& auth_registry, optional_yield y);
-  // RDMA GET state: set in get_params() when client sends x-amz-rdma-token
+  // RDMA GET state: set in get_params() when client sends x-amz-rdma-buffer
   NixlRdmaToken rdma_get_tok_{};
   bool          rdma_get_active_{false};
   size_t        rdma_write_offset_{0};
