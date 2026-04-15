@@ -51,7 +51,7 @@ protected:
   size_t        rdma_write_offset_{0};
   bool          rdma_write_pending_{false};  // true when a non-blocking write is in flight
 
-  // KV cache streaming state: set in get_params() when client sends x-amz-kvcache
+  // KV cache streaming state: set in get_params() when client sends x-amz-rdma-batch
   bool          kvcache_active_{false};
   std::vector<std::string> kvcache_chunks_;   // chunk hash keys (S3 object keys)
   int           kvcache_num_layers_{0};

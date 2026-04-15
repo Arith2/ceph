@@ -2227,7 +2227,7 @@ void RGWGetObj::execute(optional_yield y)
   if (op_ret < 0)
     goto done_err;
 
-  // KV cache streaming: if x-amz-kvcache header was parsed, short-circuit
+  // KV cache streaming: if x-amz-rdma-batch header was parsed, short-circuit
   // the normal single-object read path and stream layers via RDMA.
   if (auto* s3get = dynamic_cast<RGWGetObj_ObjStore_S3*>(this)) {
     if (s3get->is_kvcache_active()) {

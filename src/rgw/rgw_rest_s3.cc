@@ -318,7 +318,7 @@ int RGWGetObj_ObjStore_S3::get_params(optional_yield y)
   }
 
   // Check for KV cache streaming descriptor
-  const char* kvcache_hdr = s->info.env->get("HTTP_X_AMZ_KVCACHE");
+  const char* kvcache_hdr = s->info.env->get("HTTP_X_AMZ_RDMA_BATCH");
   if (kvcache_hdr && rdma_get_active_) {
     picojson::value v;
     std::string err = picojson::parse(v, std::string(kvcache_hdr));
@@ -339,7 +339,7 @@ int RGWGetObj_ObjStore_S3::get_params(optional_yield y)
         kvcache_layer_aggregate_ = (int)obj.at("layer_aggregate").get<double>();
       if (!kvcache_chunks_.empty() && kvcache_num_layers_ > 0)
         kvcache_active_ = true;
-      ldpp_dout(this, 0) << "x-amz-kvcache: chunks=" << kvcache_chunks_.size()
+      ldpp_dout(this, 0) << "x-amz-rdma-batch: chunks=" << kvcache_chunks_.size()
         << " layers=" << kvcache_num_layers_
         << " kv_per_tok_layer=" << kvcache_kv_per_token_per_layer_
         << " tok_per_chunk=" << kvcache_tokens_per_chunk_ << " layer_agg=" << kvcache_layer_aggregate_
