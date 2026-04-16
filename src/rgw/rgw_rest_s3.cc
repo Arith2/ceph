@@ -2681,6 +2681,45 @@ static inline void map_qs_metadata(req_state* s, bool crypto_too)
 
 int RGWPutObj_ObjStore_S3::get_params(optional_yield y)
 {
+  // s3rdma_batch (option-c): if the client sets x-amz-rdma-batch: 1 marker,
+  // the request body carries a JSON batch descriptor (NOT object data).
+  // Read body, parse JSON, set state, and skip the rest of the normal PUT
+  // params setup. The matching short-circuit in RGWPutObj::execute() then
+  // returns 200 OK without writing any object.
+  {
+    const char* batch_marker = s->info.env->get("HTTP_X_AMZ_RDMA_BATCH");
+    if (batch_marker && strcmp(batch_marker, "1") == 0) {
+      int rv;
+      bufferlist body_bl;
+      // Allow up to 4 MiB of JSON descriptor (~80k keys at 50 bytes each).
+      std::tie(rv, body_bl) = rgw_rest_read_all_input(s, 4 * 1024 * 1024);
+      if (rv < 0) {
+        ldpp_dout(this, 0) << "x-amz-rdma-batch: failed to read body, rv=" << rv << dendl;
+        return rv;
+      }
+      std::string body_str(body_bl.c_str(), body_bl.length());
+      picojson::value v;
+      std::string err = picojson::parse(v, body_str);
+      if (!err.empty() || !v.is<picojson::object>()) {
+        ldpp_dout(this, 0) << "x-amz-rdma-batch: bad JSON in body: " << err << dendl;
+        return -EINVAL;
+      }
+      auto& obj = v.get<picojson::object>();
+      if (obj.count("chunks") && obj.at("chunks").is<picojson::array>()) {
+        for (auto& c : obj.at("chunks").get<picojson::array>()) {
+          if (c.is<std::string>()) rdma_batch_chunks_.push_back(c.get<std::string>());
+        }
+      }
+      rdma_batch_marker_active_ = true;
+      ldpp_dout(this, 0) << "x-amz-rdma-batch (body): chunks=" << rdma_batch_chunks_.size()
+                         << " body_size=" << body_bl.length() << dendl;
+      // Tell the framework this PUT carries no object data — execute() will
+      // see is_rdma_batch_marker_active() and return 200 immediately.
+      s->content_length = 0;
+      return 0;
+    }
+  }
+
   if (!s->length) {
     const char *encoding = s->info.env->get("HTTP_TRANSFER_ENCODING");
     if (!encoding || strcmp(encoding, "chunked") != 0) {

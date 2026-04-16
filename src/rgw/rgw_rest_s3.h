@@ -292,8 +292,13 @@ private:
   uint64_t       rdma_buf_len_   = 0;         // total transfer size (from token)
   uint64_t       rdma_buf_ofs_   = 0;         // bytes fed to execute() so far
   NixlRdmaToken  rdma_saved_tok_{};           // saved token for multi-chunk reads
+  // s3rdma_batch (option-c): client sends marker 'x-amz-rdma-batch: 1' header
+  // and JSON descriptor in body; we early-exit without writing.
+  bool                       rdma_batch_marker_active_ = false;
+  std::vector<std::string>   rdma_batch_chunks_;
 
 public:
+  bool is_rdma_batch_marker_active() const { return rdma_batch_marker_active_; }
   RGWPutObj_ObjStore_S3() {}
   ~RGWPutObj_ObjStore_S3() override = default;
 

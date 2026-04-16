@@ -3989,6 +3989,17 @@ int RGWPutObj::get_lua_filter(std::unique_ptr<rgw::sal::DataProcessor>* filter, 
 
 void RGWPutObj::execute(optional_yield y)
 {
+  // s3rdma_batch (option-c): early-exit if x-amz-rdma-batch marker was
+  // detected in get_params(). Body is the JSON descriptor (already read +
+  // parsed); we just send 200 OK without writing any object.
+  if (auto* s3put = dynamic_cast<RGWPutObj_ObjStore_S3*>(this)) {
+    if (s3put->is_rdma_batch_marker_active()) {
+      ldpp_dout(this, 0) << "x-amz-rdma-batch (body): short-circuit, sending 200 OK" << dendl;
+      op_ret = 0;
+      // send_response() will dump 200 OK with empty body.
+      return;
+    }
+  }
   char supplied_md5_bin[CEPH_CRYPTO_MD5_DIGESTSIZE + 1];
   char supplied_md5[CEPH_CRYPTO_MD5_DIGESTSIZE * 2 + 1];
   char calc_md5[CEPH_CRYPTO_MD5_DIGESTSIZE * 2 + 1];
