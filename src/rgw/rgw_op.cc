@@ -5,6 +5,8 @@
 #include <stdlib.h>
 #include <system_error>
 #include <unistd.h>
+#include <curl/curl.h>  // agg-forward to gather daemon
+#include "picojson/picojson.h"  // JSON parse for agg-forward body type check
 
 #include <sstream>
 #include <string_view>
@@ -3989,15 +3991,79 @@ int RGWPutObj::get_lua_filter(std::unique_ptr<rgw::sal::DataProcessor>* filter, 
 
 void RGWPutObj::execute(optional_yield y)
 {
-  // s3rdma_batch (option-c): early-exit if x-amz-rdma-batch marker was
-  // detected in get_params(). Body is the JSON descriptor (already read +
-  // parsed); we just send 200 OK without writing any object.
-  if (auto* s3put = dynamic_cast<RGWPutObj_ObjStore_S3*>(this)) {
-    if (s3put->is_rdma_batch_marker_active()) {
-      ldpp_dout(this, 0) << "x-amz-rdma-batch (body): short-circuit, sending 200 OK" << dendl;
+  // s3rdma_batch / s3rdma_agg: if x-amz-rdma-batch: 1 marker is present,
+  // read the body as JSON. For agg_* typed bodies, forward to the gather
+  // daemon and return its response. For other bodies, short-circuit with 200.
+  // NOTE: this runs in execute() (not get_params()) because the DAOS SAL
+  // benchmark build bypasses verify_permission→get_params entirely.
+  {
+    const char* batch_marker = s->info.env->get("HTTP_X_AMZ_RDMA_BATCH");
+    if (batch_marker && std::strcmp(batch_marker, "1") == 0) {
+      auto* s3put = dynamic_cast<RGWPutObj_ObjStore_S3*>(this);
+      // Read body (up to 4 MiB)
+      int rv; bufferlist body_bl;
+      std::tie(rv, body_bl) = rgw_rest_read_all_input(s, 4 * 1024 * 1024);
+      if (rv < 0) {
+        ldpp_dout(this, 0) << "x-amz-rdma-batch: body read failed rv=" << rv << dendl;
+        op_ret = rv; return;
+      }
+      std::string body_str(body_bl.c_str(), body_bl.length());
+      ldpp_dout(this, 0) << "x-amz-rdma-batch: body_len=" << body_str.size() << dendl;
+
+      // Check if this is an agg_* forwarding request
+      picojson::value v;
+      std::string perr = picojson::parse(v, body_str);
+      bool is_agg = false;
+      if (perr.empty() && v.is<picojson::object>()) {
+        auto& obj = v.get<picojson::object>();
+        if (obj.count("type") && obj.at("type").is<std::string>()) {
+          std::string t = obj.at("type").get<std::string>();
+          if (t.rfind("agg_", 0) == 0) is_agg = true;
+        }
+      }
+
+      if (is_agg && s3put) {
+        // Forward body to gather daemon via synchronous libcurl POST
+        const char* daemon_url_env = std::getenv("RGW_AGG_DAEMON_URL");
+        std::string base = daemon_url_env ? daemon_url_env : "http://hsc-21:8080";
+        picojson::value vp;
+        picojson::parse(vp, body_str);
+        std::string t = vp.get<picojson::object>().at("type").get<std::string>();
+        std::string path = (t == "agg_session_setup") ? "/agg/_session" : "/agg/_open";
+        std::string url = base + path;
+
+        CURL* c = curl_easy_init();
+        if (!c) { op_ret = -EIO; return; }
+        struct curl_slist* hdrs = nullptr;
+        hdrs = curl_slist_append(hdrs, "Content-Type: application/json");
+        std::string resp;
+        auto write_cb = +[](char* p, size_t sz, size_t n, void* ud) -> size_t {
+          static_cast<std::string*>(ud)->append(p, sz * n); return sz * n;
+        };
+        curl_easy_setopt(c, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(c, CURLOPT_POST, 1L);
+        curl_easy_setopt(c, CURLOPT_POSTFIELDS, body_str.c_str());
+        curl_easy_setopt(c, CURLOPT_POSTFIELDSIZE, (long)body_str.size());
+        curl_easy_setopt(c, CURLOPT_HTTPHEADER, hdrs);
+        curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, write_cb);
+        curl_easy_setopt(c, CURLOPT_WRITEDATA, &resp);
+        curl_easy_setopt(c, CURLOPT_TIMEOUT, 30L);
+        CURLcode rc = curl_easy_perform(c);
+        long http_code = 0;
+        curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &http_code);
+        curl_slist_free_all(hdrs);
+        curl_easy_cleanup(c);
+        if (rc != CURLE_OK || http_code != 200) {
+          ldpp_dout(this, 0) << "agg-forward FAIL url=" << url
+                             << " curl=" << rc << " http=" << http_code << dendl;
+          op_ret = -EIO; return;
+        }
+        ldpp_dout(this, 0) << "agg-forward ok url=" << url
+                           << " resp_len=" << resp.size() << dendl;
+        s3put->set_agg_forward(std::move(resp));
+      }
       op_ret = 0;
-      // send_response() will dump 200 OK with empty body.
-      return;
+      return;  // skip normal PUT data pipeline
     }
   }
   char supplied_md5_bin[CEPH_CRYPTO_MD5_DIGESTSIZE + 1];

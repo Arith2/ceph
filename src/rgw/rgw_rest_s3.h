@@ -296,9 +296,16 @@ private:
   // and JSON descriptor in body; we early-exit without writing.
   bool                       rdma_batch_marker_active_ = false;
   std::vector<std::string>   rdma_batch_chunks_;
+  // s3rdma_agg (option-y): body contains "type":"agg_*" — RGW forwards the
+  // body verbatim to the gather daemon and relays the JSON response back.
+  bool                       agg_forward_mode_ = false;
+  std::string                agg_resp_body_;
 
 public:
   bool is_rdma_batch_marker_active() const { return rdma_batch_marker_active_; }
+  bool is_agg_forward_mode() const { return agg_forward_mode_; }
+  const std::string& get_agg_resp_body() const { return agg_resp_body_; }
+  void set_agg_forward(std::string resp) { agg_forward_mode_ = true; agg_resp_body_ = std::move(resp); }
   RGWPutObj_ObjStore_S3() {}
   ~RGWPutObj_ObjStore_S3() override = default;
 

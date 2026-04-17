@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <array>
 #include <string.h>
+#include <curl/curl.h>  // agg-forward synchronous POST to gather daemon
 #include <string_view>
 
 #include "common/ceph_crypto.h"
@@ -2681,6 +2682,12 @@ static inline void map_qs_metadata(req_state* s, bool crypto_too)
 
 int RGWPutObj_ObjStore_S3::get_params(optional_yield y)
 {
+  // NOTE: in the DAOS SAL benchmark build, rgw_process.cc bypasses
+  // verify_permission → get_params entirely (see comment in
+  // rgw_process.cc for "BENCH-DIAGNOSTIC"). The x-amz-rdma-batch
+  // marker handling therefore lives in RGWPutObj::execute() in
+  // rgw_op.cc rather than here. Kept here as a no-op entry so base
+  // class callers (non-benchmark builds) still work.
   // s3rdma_batch (option-c): if the client sets x-amz-rdma-batch: 1 marker,
   // the request body carries a JSON batch descriptor (NOT object data).
   // Read body, parse JSON, set state, and skip the rest of the normal PUT
@@ -2713,6 +2720,57 @@ int RGWPutObj_ObjStore_S3::get_params(optional_yield y)
       rdma_batch_marker_active_ = true;
       ldpp_dout(this, 0) << "x-amz-rdma-batch (body): chunks=" << rdma_batch_chunks_.size()
                          << " body_size=" << body_bl.length() << dendl;
+
+      // s3rdma_agg (option-y): if body has "type":"agg_*", forward it to the
+      // gather daemon via HTTP and stash the response body for send_response.
+      if (obj.count("type") && obj.at("type").is<std::string>()) {
+        std::string t = obj.at("type").get<std::string>();
+        if (t.rfind("agg_", 0) == 0) {
+          const char* daemon_url_env = std::getenv("RGW_AGG_DAEMON_URL");
+          std::string base = daemon_url_env ? daemon_url_env : "http://hsc-21:8080";
+          std::string path = (t == "agg_session_setup") ? "/agg/_session" : "/agg/_open";
+          std::string url  = base + path;
+
+          CURL* c = curl_easy_init();
+          if (!c) {
+            ldpp_dout(this, 0) << "agg-forward: curl_easy_init failed" << dendl;
+            return -EIO;
+          }
+          struct curl_slist* hdrs = nullptr;
+          hdrs = curl_slist_append(hdrs, "Content-Type: application/json");
+          std::string resp;
+          auto write_cb = +[](char* p, size_t s, size_t n, void* ud) -> size_t {
+            auto* out = static_cast<std::string*>(ud);
+            out->append(p, s * n);
+            return s * n;
+          };
+          curl_easy_setopt(c, CURLOPT_URL, url.c_str());
+          curl_easy_setopt(c, CURLOPT_POST, 1L);
+          curl_easy_setopt(c, CURLOPT_POSTFIELDS, body_str.c_str());
+          curl_easy_setopt(c, CURLOPT_POSTFIELDSIZE, (long)body_str.size());
+          curl_easy_setopt(c, CURLOPT_HTTPHEADER, hdrs);
+          curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, write_cb);
+          curl_easy_setopt(c, CURLOPT_WRITEDATA, &resp);
+          curl_easy_setopt(c, CURLOPT_TIMEOUT, 30L);
+          CURLcode rc2 = curl_easy_perform(c);
+          long http_code = 0;
+          curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &http_code);
+          curl_slist_free_all(hdrs);
+          curl_easy_cleanup(c);
+          if (rc2 != CURLE_OK || http_code != 200) {
+            ldpp_dout(this, 0) << "agg-forward FAIL rc=" << rc2
+                               << " http=" << http_code
+                               << " url=" << url
+                               << " body=" << resp << dendl;
+            return -EIO;
+          }
+          ldpp_dout(this, 0) << "agg-forward ok  url=" << url
+                             << " resp_len=" << resp.size() << dendl;
+          agg_forward_mode_ = true;
+          agg_resp_body_    = std::move(resp);
+        }
+      }
+
       // Tell the framework this PUT carries no object data — execute() will
       // see is_rdma_batch_marker_active() and return 200 immediately.
       s->content_length = 0;
@@ -2934,6 +2992,19 @@ static int get_success_retcode(int code)
 
 void RGWPutObj_ObjStore_S3::send_response()
 {
+  // s3rdma_agg (option-y): if we forwarded to the gather daemon, return the
+  // daemon's JSON body as the PUT response body so the client can finish the
+  // QP handshake / open flow.
+  if (!op_ret && agg_forward_mode_) {
+    dump_errno(s);
+    dump_header(s, "Content-Type", "application/json");
+    dump_content_length(s, (uint64_t)agg_resp_body_.size());
+    end_header(s, this);
+    s->formatter->write_raw_data(agg_resp_body_.c_str());
+    rgw_flush_formatter_and_reset(s, s->formatter);
+    return;
+  }
+
   if (op_ret) {
     set_req_state_err(s, op_ret);
     dump_errno(s);
