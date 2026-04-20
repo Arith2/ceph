@@ -311,8 +311,14 @@ int DaosUser::create_bucket(
     bufferlist bl;
     std::unique_ptr<struct ds3_bucket_info> bucket_info =
         daos_bucket->get_encoded_info(bl, ceph::real_time());
+    // Force OC_SX for the bucket's underlying DAOS container so it matches
+    // run_nixl_local_dfs.sh's "--dir-oclass=SX --file-oclass=SX" layout.
+    // Previous call passed nullptr which selected default oclass.
+    dfs_attr_t dfs_attr = {};
+    dfs_attr.da_dir_oclass_id  = OC_SX;
+    dfs_attr.da_file_oclass_id = OC_SX;
     ret = ds3_bucket_create(bucket->get_name().c_str(), bucket_info.get(),
-                            nullptr, store->ds3, nullptr);
+                            &dfs_attr, store->ds3, nullptr);
     if (ret != 0) {
       ldpp_dout(dpp, 0) << "ERROR: ds3_bucket_create failed! ret=" << ret
                         << dendl;
@@ -1846,10 +1852,16 @@ int DaosObject::get_dir_entry_attrs(const DoutPrefixProvider* dpp,
 int DaosObject::set_dir_entry_attrs(const DoutPrefixProvider* dpp,
                                     rgw_bucket_dir_entry* ent,
                                     Attrs* setattrs) {
-  // BENCH-DIAGNOSTIC: skip ds3_obj_set_info entirely. With anonymous auth
-  // (S3 Express emulation) the encoded owner is empty and ds3_obj_set_info
-  // returns -EINVAL. We don\u2019t need persistent object metadata for the bench.
-  return 0;
+  // Persist the object's dirent (including meta.size) as a DAOS xattr so
+  // subsequent Range GETs can see the correct obj_size. The old early-
+  // return was "BENCH-DIAGNOSTIC" — fine for content-addressed LMCache but
+  // breaks Range reads (range_to_ofs sees obj_size=0 → HTTP 416 InvalidRange).
+  //
+  // Under anonymous auth the encoded owner may be empty and ds3_obj_set_info
+  // can return -EINVAL; in that case we log and swallow so the PUT itself
+  // still succeeds. GET's get_dir_entry_attrs already has a dfs_get_size
+  // fallback that handles the no-xattr case — this write is just the
+  // belt-and-suspenders so we don't rely on the fallback alone.
   ldpp_dout(dpp, 20) << "DEBUG: set_dir_entry_attrs" << dendl;
   int ret = lookup(dpp);
   if (ret != 0) {
@@ -1877,9 +1889,14 @@ int DaosObject::set_dir_entry_attrs(const DoutPrefixProvider* dpp,
   object_info->encoded_length = wbl.length();
   ret = ds3_obj_set_info(object_info.get(), get_daos_bucket()->ds3b, ds3o);
   if (ret != 0) {
-    ldpp_dout(dpp, 0) << "ERROR: failed to set info of daos object ("
+    // Swallow anon-auth "empty owner" failures so the PUT still succeeds.
+    // GET falls back to dfs_get_size so the missing xattr is tolerable.
+    ldpp_dout(dpp, 0) << "WARN: ds3_obj_set_info failed ("
                       << get_bucket()->get_name() << ", " << get_key().get_oid()
-                      << "): ret=" << ret << dendl;
+                      << "): ret=" << ret
+                      << " — swallowing, GET will fall back to dfs_get_size"
+                      << dendl;
+    ret = 0;
   }
   return ret;
 }
