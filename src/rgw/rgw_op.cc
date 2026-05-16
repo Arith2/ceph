@@ -4025,7 +4025,7 @@ void RGWPutObj::execute(optional_yield y)
       if (is_agg && s3put) {
         // Forward body to gather daemon via synchronous libcurl POST
         const char* daemon_url_env = std::getenv("RGW_AGG_DAEMON_URL");
-        std::string base = daemon_url_env ? daemon_url_env : "http://hsc-21:8080";
+        std::string base = daemon_url_env ? daemon_url_env : "http://localhost:8080";
         picojson::value vp;
         picojson::parse(vp, body_str);
         std::string t = vp.get<picojson::object>().at("type").get<std::string>();

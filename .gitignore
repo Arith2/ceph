@@ -6,6 +6,8 @@
 *.tar.bz2
 *.dsc
 *.changes
+*.buildinfo
+*.bak*
 *.gcda
 *.gcov
 *.gcno

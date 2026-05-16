@@ -2727,7 +2727,7 @@ int RGWPutObj_ObjStore_S3::get_params(optional_yield y)
         std::string t = obj.at("type").get<std::string>();
         if (t.rfind("agg_", 0) == 0) {
           const char* daemon_url_env = std::getenv("RGW_AGG_DAEMON_URL");
-          std::string base = daemon_url_env ? daemon_url_env : "http://hsc-21:8080";
+          std::string base = daemon_url_env ? daemon_url_env : "http://localhost:8080";
           std::string path = (t == "agg_session_setup") ? "/agg/_session" : "/agg/_open";
           std::string url  = base + path;
 
